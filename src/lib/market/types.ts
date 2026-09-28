@@ -41,7 +41,7 @@ export type Forces = {
 };
 
 export type Quote = {
-	price: number; // the battle value (BTC price, or $OSIRIS market cap)
+	price: number; // the battle value (SOL price, or $OSIRIS market cap)
 	change24h: number; // %
 	sub?: string; // secondary line, e.g. the token price
 };
@@ -62,7 +62,7 @@ export interface MarketFeed {
 
 /** How a theater's numbers map onto the battlefield. */
 export type Theater = {
-	id: 'osiris' | 'btc';
+	id: 'osiris' | 'sol';
 	name: string; // short name for the switcher
 	/** HUD label above the price, naming the active book source. */
 	pairLabel(source: string): string;
@@ -75,8 +75,8 @@ export type Theater = {
 	price(v: number): string;
 	/** USD thresholds that turn events into battlefield strikes. `liq` = the size that scales them. */
 	tiers(liq: number): StrikeTiers;
-	/** Liquidations drive strikes on BTC; on $OSIRIS the whale trades themselves do. */
-	strikesFrom: 'liquidation' | 'trade';
+	/** What calls in air strikes: whale trades only ($OSIRIS), or whale trades and liquidations (SOL). */
+	strikesFrom: 'trade' | 'both';
 };
 
 export type StrikeTiers = {
@@ -85,5 +85,7 @@ export type StrikeTiers = {
 	heli: number; // helicopter rocket strike
 	jet: number; // jet strike
 	bomber: number; // bombing run
+	nuke: number; // tactical nuke
+	barrage: number; // a liquidation this big fires a rocket barrage
 	feed: number; // smallest trade worth a line in the Market Feed
 };

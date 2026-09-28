@@ -4,11 +4,11 @@
 	import { Battlefield, type BattleStats, type RoundEvent, type Scale, type Team } from '$lib/battle/engine';
 	import { THEATERS } from '$lib/market/theaters';
 	import { OsirisFeed } from '$lib/market/osiris';
-	import { BtcFeed } from '$lib/market/btc';
+	import { SolFeed } from '$lib/market/sol';
 	import type { Depth, Forces, MarketEvent, MarketFeed, Quote, StrikeTiers, Theater, Venue } from '$lib/market/types';
 	import { usd, grouped, shortAddr, utc } from '$lib/market/format';
 
-	type TheaterId = 'osiris' | 'btc';
+	type TheaterId = 'osiris' | 'sol';
 	type Tone = 'bull' | 'bear' | 'neutral';
 	type FeedItem = { id: number; tone: Tone; text: string; amount: string; badge: string; badgeTone: string; href?: string; title: string };
 
@@ -39,14 +39,18 @@
 	let banner = $state<{ kind: 'new' | 'win'; team?: Team; title: string; line: string; sub?: string; id: number } | null>(null);
 	let showTick = $state(true);
 	let failed = $state(false);
+	let alert = $state<{ team: Team; line: string; id: number } | null>(null);
+	let flash = $state(0); // bumps on every detonation, restarting the white-out
+	let flashLevel = $state(1);
 
 	let prevPrice = 0;
 	let ticks: { t: number; p: number }[] = [];
 	let feedId = 0;
 	let bannerTimer: ReturnType<typeof setTimeout> | undefined;
+	let alertTimer: ReturnType<typeof setTimeout> | undefined;
 	let titleAt = 0;
 
-	const VENUE: Record<Venue | 'strike' | 'round', [string, string]> = {
+	const VENUE: Record<Venue | 'strike' | 'nuke' | 'round', [string, string]> = {
 		Coinbase: ['C', '#1d5cff'],
 		Kraken: ['K', '#6c4df2'],
 		Binance: ['B', '#e8b30b'],
@@ -54,20 +58,21 @@
 		Bybit: ['Y', '#f7a600'],
 		PumpSwap: ['P', '#4ade80'],
 		strike: ['✈', '#9fb3c8'],
+		nuke: ['☢', '#ffd23f'],
 		round: ['⚑', '#e8e3c8']
 	};
-	const STRIKE_NAME = { heli: 'Helicopter strike', jet: 'Jet strike', bomber: 'Bombing run' } as const;
+	const STRIKE_NAME = { heli: 'Helicopter strike', jet: 'Jet strike', bomber: 'Bombing run', nuke: 'Tactical nuke' } as const;
 
 	const scaleOf = (t: Theater): Scale => ({
 		step: t.step,
 		level: t.level,
 		price: t.price,
-		current: t.id === 'btc' ? 'CURRENT PRICE' : 'CURRENT MARKET CAP'
+		current: t.id === 'sol' ? 'CURRENT PRICE' : 'CURRENT MARKET CAP'
 	});
 
 	const tiers = (): StrikeTiers => theater.tiers(forces?.liquidity ?? 0);
 
-	function push(i: Omit<FeedItem, 'id' | 'badge' | 'badgeTone'> & { venue: Venue | 'strike' | 'round' }) {
+	function push(i: Omit<FeedItem, 'id' | 'badge' | 'badgeTone'> & { venue: Venue | 'strike' | 'nuke' | 'round' }) {
 		const [badge, badgeTone] = VENUE[i.venue];
 		items = [{ ...i, id: ++feedId, badge, badgeTone }, ...items].slice(0, 40);
 	}
@@ -104,34 +109,43 @@
 		return Math.max(3, Math.min(16, Math.round(3 + 4 * Math.log10(1 + v / Math.max(5, t.squad)))));
 	}
 
-	/** Map an event size to an air strike tier (or a rocket barrage). */
-	function strikeFor(v: number, attacker: Team, t: StrikeTiers, barrageMin: number) {
-		const tier = v >= t.bomber ? 'bomber' : v >= t.jet ? 'jet' : v >= t.heli ? 'heli' : null;
+	/** Map an event size to an air strike tier (or a rocket barrage). `what` names the cause. */
+	function strikeFor(v: number, attacker: Team, t: StrikeTiers, barrageMin: number, what: string) {
+		const tier = v >= t.nuke ? 'nuke' : v >= t.bomber ? 'bomber' : v >= t.jet ? 'jet' : v >= t.heli ? 'heli' : null;
 		if (!tier) {
 			if (v >= barrageMin) bf?.strike('barrage', attacker, 1);
 			return;
 		}
-		bf?.strike(tier, attacker, Math.min(2.2, 1 + 0.35 * Math.log2(v / t[tier])));
+		const side = attacker === 'bull' ? 'Bulls' : 'Bears';
+		bf?.strike(tier, attacker, Math.min(tier === 'nuke' ? 1.8 : 2.2, 1 + 0.35 * Math.log2(v / t[tier])));
 		push({
 			tone: attacker,
-			text: `${STRIKE_NAME[tier]} · ${attacker === 'bull' ? 'Bulls' : 'Bears'}`,
+			text: `${STRIKE_NAME[tier]} · ${side}`,
 			amount: usd(v),
-			venue: 'strike',
-			title: `${STRIKE_NAME[tier]} flown by the ${attacker === 'bull' ? 'Bulls' : 'Bears'}`
+			venue: tier === 'nuke' ? 'nuke' : 'strike',
+			title: `${STRIKE_NAME[tier]} flown by the ${side}: ${what}`
 		});
+		if (tier === 'nuke') {
+			clearTimeout(alertTimer);
+			alert = { team: attacker, line: `${side} · ${what}`, id: ++feedId };
+			alertTimer = setTimeout(() => (alert = null), 3400);
+		}
 	}
 
 	function onEvent(e: MarketEvent) {
 		const t = tiers();
+		const sol = theaterId === 'sol';
 		if (e.type === 'trade') {
 			const team: Team = e.side === 'buy' ? 'bull' : 'bear';
-			const btc = theaterId === 'btc';
+			const text = sol
+				? `${e.usd >= t.tank ? 'Whale' : 'Large'} ${e.side}`
+				: `${e.side === 'buy' ? 'Buy' : 'Sell'} · ${shortAddr(e.wallet)}`;
 			if (!e.history) {
 				if (e.usd >= t.squad) bf?.reinforce(team, squadSize(e.usd, t), e.usd >= t.tank);
-				if (theater.strikesFrom === 'trade') strikeFor(e.usd, team, t, Infinity);
+				// every live buy and sell can call in air power, sized by the order
+				strikeFor(e.usd, team, t, Infinity, `${usd(e.usd)} ${e.side} · ${e.venue}`);
 			}
 			if (e.usd < t.feed) return;
-			const text = btc ? `Large ${e.side} trade` : `${e.side === 'buy' ? 'Buy' : 'Sell'} · ${shortAddr(e.wallet)}`;
 			push({
 				tone: team,
 				text,
@@ -140,13 +154,13 @@
 				href: e.tx ? `https://solscan.io/tx/${e.tx}` : undefined,
 				title: `${e.venue} ${text} ${usd(e.usd)}`
 			});
-			lastEvent = `${e.venue} · ${btc ? text : e.side === 'buy' ? 'Buy' : 'Sell'}`; // history arrives oldest-first, so this ends on the latest
+			lastEvent = `${e.venue} · ${sol ? text : e.side === 'buy' ? 'Buy' : 'Sell'}`; // history arrives oldest-first, so this ends on the latest
 		} else {
 			// a liquidated long is a forced sell: it lands on the Bulls
 			const attacker: Team = e.side === 'long' ? 'bear' : 'bull';
-			strikeFor(e.usd, attacker, t, 10_000);
-			if (e.usd < 5_000) return;
 			const text = e.side === 'long' ? 'Long liquidated' : 'Short liquidated';
+			if (theater.strikesFrom === 'both') strikeFor(e.usd, attacker, t, t.barrage, `${usd(e.usd)} ${text.toLowerCase()} · ${e.venue}`);
+			if (e.usd < t.barrage) return;
 			push({ tone: attacker, text, amount: usd(e.usd), venue: e.venue, title: `${e.venue} ${text} ${usd(e.usd)}` });
 			lastEvent = `${e.venue} · ${text}`;
 		}
@@ -181,16 +195,17 @@
 		ticks = [];
 		range = null;
 		banner = null;
+		alert = null;
 		stats = null;
 		lastEvent = 'Watching the tape';
 		bf?.setScale(scaleOf(THEATERS[id]));
-		feed = id === 'btc' ? new BtcFeed() : new OsirisFeed();
+		feed = id === 'sol' ? new SolFeed() : new OsirisFeed();
 		sources = feed.sources;
 		source = feed.sources[0].id;
 		feed.start({ quote: onQuote, depth: onDepth, event: onEvent, status: (s) => (status = s) });
 		if (updateUrl) {
 			const u = new URL(location.href);
-			if (id === 'btc') u.searchParams.set('m', 'btc');
+			if (id === 'sol') u.searchParams.set('m', 'sol');
 			else u.searchParams.delete('m');
 			replaceState(u, {});
 		}
@@ -203,7 +218,14 @@
 
 	onMount(() => {
 		try {
-			bf = new Battlefield(canvas, { round: onRound, stats: (s) => (stats = s) });
+			bf = new Battlefield(canvas, {
+				round: onRound,
+				stats: (s) => (stats = s),
+				flash: (k) => {
+					flashLevel = k;
+					flash++;
+				}
+			});
 			if (import.meta.env.DEV) (window as any).__bf = bf; // console access while developing
 		} catch (err) {
 			console.error(err);
@@ -211,13 +233,14 @@
 			return;
 		}
 		// the URL already names the theater on load (and the router isn't ready to rewrite it yet)
-		startTheater(new URLSearchParams(location.search).get('m') === 'btc' ? 'btc' : 'osiris', false);
+		startTheater(new URLSearchParams(location.search).get('m') === 'sol' ? 'sol' : 'osiris', false);
 		const c = setInterval(() => (clock = utc()), 1000);
 		const flip = setInterval(() => (showTick = !showTick), 5000);
 		return () => {
 			clearInterval(c);
 			clearInterval(flip);
 			clearTimeout(bannerTimer);
+			clearTimeout(alertTimer);
 			feed?.stop();
 			bf?.dispose();
 		};
@@ -259,7 +282,7 @@
 	});
 
 	const sourceLabel = $derived(sources.find((s) => s.id === source)?.label ?? '');
-	const axis = (v: number) => (theaterId === 'btc' ? grouped(v, 2) : grouped(v));
+	const axis = (v: number) => (theaterId === 'sol' ? grouped(v, 2) : grouped(v));
 	const pressureText = $derived(pressure === 'bull' ? 'Buyers advancing' : pressure === 'bear' ? 'Sellers advancing' : 'Holding the line');
 	const tickText = $derived(
 		showTick || !change24
@@ -274,6 +297,10 @@
 	<title>OSIRIS Battlefield</title>
 </svelte:head>
 
+<a class="osirisbar" href="https://www.osirisai.live/" target="_blank" rel="noopener">
+	<span class="ankh">☥</span> <span class="full">OSIRIS INTELLIGENCE NETWORK <span class="sep">·</span></span> <b>osirisai.live</b> <span class="arrow">↗</span>
+</a>
+
 <main>
 	<canvas bind:this={canvas} aria-label="3D battlefield"></canvas>
 
@@ -287,10 +314,10 @@
 	<!-- top-left: clock, brand, theater -->
 	<div class="tl">
 		<div class="clock mono" aria-label="UTC time">UTC {clock}</div>
-		<div class="brand">
+		<a class="brand" href="https://www.osirisai.live/" target="_blank" rel="noopener">
 			<span class="ankh">☥</span>
 			<span>OSIRIS <b>BATTLEFIELD</b></span>
-		</div>
+		</a>
 		<div class="theaters" role="tablist" aria-label="Market">
 			{#each Object.values(THEATERS) as t (t.id)}
 				<button role="tab" aria-selected={theaterId === t.id} class:on={theaterId === t.id} onclick={() => theaterId !== t.id && startTheater(t.id)}>
@@ -361,6 +388,18 @@
 			</div>
 		{/key}
 	{/if}
+
+	{#if alert}
+		{#key alert.id}
+			<div class="nuke-alert {alert.team}" role="alert">
+				<div class="na-title">☢ TACTICAL NUKE INBOUND</div>
+				<div class="na-line mono">{alert.line}</div>
+			</div>
+		{/key}
+	{/if}
+	{#key flash}
+		{#if flash}<div class="whiteout" style="--k:{flashLevel}"></div>{/if}
+	{/key}
 
 	<!-- bottom-left: depth -->
 	<section class="panel depth" class:closed={!depthOpen} aria-label="Buy and sell wall depth chart">
@@ -457,9 +496,42 @@
 </main>
 
 <style>
+	.osirisbar {
+		position: fixed;
+		inset: 0 0 auto 0;
+		height: 30px;
+		z-index: 10;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 7px;
+		font: 700 11.5px var(--sans);
+		letter-spacing: 0.08em;
+		color: #1b1405;
+		text-decoration: none;
+		background: linear-gradient(90deg, #a87a26, #f0cd72 30%, #f7dc8e 50%, #f0cd72 70%, #a87a26);
+		box-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
+		white-space: nowrap;
+	}
+	.osirisbar b {
+		font-weight: 800;
+		letter-spacing: 0.02em;
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+	.osirisbar .ankh {
+		color: #1b1405;
+		font-size: 14px;
+	}
+	.osirisbar .sep {
+		opacity: 0.5;
+	}
+	.osirisbar:hover {
+		filter: brightness(1.08);
+	}
 	main {
 		position: fixed;
-		inset: 0;
+		inset: 30px 0 0 0;
 		overflow: hidden;
 		user-select: none;
 	}
@@ -524,6 +596,14 @@
 	}
 	.brand b {
 		color: var(--text);
+	}
+	a.brand {
+		text-decoration: none;
+		pointer-events: auto;
+		width: max-content;
+	}
+	a.brand:hover b {
+		color: #f0cd72;
 	}
 	.ankh {
 		color: #e8c46a;
@@ -802,6 +882,61 @@
 		from {
 			opacity: 0;
 			transform: translate(-50%, -10px);
+		}
+	}
+
+	/* ── nuke alert + detonation white-out ── */
+	.nuke-alert {
+		position: absolute;
+		top: 40%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		text-align: center;
+		pointer-events: none;
+		padding: 14px 30px 16px;
+		border-radius: 10px;
+		background: rgba(20, 16, 4, 0.9);
+		border: 3px solid transparent;
+		border-image: repeating-linear-gradient(45deg, #ffd23f 0 12px, #111 12px 24px) 3;
+		animation: pop 0.35s cubic-bezier(0.2, 1.3, 0.4, 1) both, alarm 0.5s steps(2, jump-none) infinite;
+		box-shadow: 0 0 80px rgba(255, 210, 63, 0.35);
+	}
+	.na-title {
+		font-family: var(--pixel);
+		font-size: 20px;
+		letter-spacing: 0.06em;
+		color: #ffd23f;
+		text-shadow: 0 0 18px rgba(255, 190, 40, 0.8);
+	}
+	.na-line {
+		font-size: 13px;
+		font-weight: 800;
+		margin-top: 9px;
+	}
+	.nuke-alert.bull .na-line {
+		color: #9ff5bd;
+	}
+	.nuke-alert.bear .na-line {
+		color: #ffb0b4;
+	}
+	@keyframes alarm {
+		50% {
+			background: rgba(70, 16, 8, 0.92);
+		}
+	}
+	.whiteout {
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		background: radial-gradient(60% 60% at 50% 45%, #fff, #fff6dc 55%, #ffd9a0);
+		animation: whiteout 1.8s ease-out forwards;
+	}
+	@keyframes whiteout {
+		0% {
+			opacity: var(--k);
+		}
+		100% {
+			opacity: 0;
 		}
 	}
 
@@ -1148,6 +1283,17 @@
 		}
 		.banner.win .b-title {
 			font-size: 22px;
+		}
+	}
+	@media (max-width: 620px) {
+		.osirisbar .full {
+			display: none;
+		}
+		.na-title {
+			font-size: 13px;
+		}
+		.icon.sound span {
+			display: none;
 		}
 	}
 	@media (max-width: 520px) {

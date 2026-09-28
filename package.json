@@ -1,6 +1,6 @@
 {
 	"name": "osiris-battlefield",
-	"description": "OSIRIS Battlefield — the live $OSIRIS market as a real-time 3D war: the front line rides the market cap, depth fields the armies, whale trades call in air strikes.",
+	"description": "OSIRIS Battlefield — the live $OSIRIS and SOL markets as a real-time 3D war: the front line rides the price, depth fields the armies, whale buys and sells call in jets, bombers and tiny nukes.",
 	"private": true,
 	"version": "1.0.0",
 	"type": "module",

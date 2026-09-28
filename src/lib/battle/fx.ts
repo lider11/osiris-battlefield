@@ -75,7 +75,7 @@ void main() {
 }`;
 
 /** One pool of camera-facing particles sharing a texture and blend mode. */
-class Particles {
+export class Particles {
 	readonly mesh: THREE.Mesh;
 	private geo: THREE.InstancedBufferGeometry;
 	private n = 0;
@@ -204,7 +204,7 @@ type Tracer = {
 };
 
 type Ordnance = {
-	kind: 'rocket' | 'missile' | 'bomb';
+	kind: 'rocket' | 'missile' | 'bomb' | 'warhead';
 	x: number; y: number; z: number;
 	sx: number; sy: number; sz: number;
 	tx: number; ty: number; tz: number;
@@ -217,14 +217,14 @@ type Ring = { x: number; y: number; z: number; age: number; life: number; r: num
 
 export type FxHooks = {
 	shake(amount: number, x: number, z: number): void;
-	sound(kind: 'boom' | 'shot' | 'cannon' | 'rocket' | 'whoosh', x: number, z: number, scale: number): void;
+	sound(kind: 'boom' | 'shot' | 'cannon' | 'rocket' | 'whoosh' | 'gun', x: number, z: number, scale: number): void;
 	crater(x: number, z: number, r: number): void;
 };
 
 export class Fx {
 	readonly group = new THREE.Group();
-	private add: Particles;
-	private smoke: Particles;
+	readonly add: Particles; // additive: fire, flashes, sparks
+	readonly smoke: Particles; // alpha: smoke, dust, debris
 	private tracers: Tracer[] = [];
 	private tracerMesh: THREE.InstancedMesh;
 	private ords: Ordnance[] = [];
@@ -240,8 +240,8 @@ export class Fx {
 
 	constructor(private hooks: FxHooks) {
 		const glow = glowTexture();
-		this.add = new Particles(6000, glow, true);
-		this.smoke = new Particles(5000, smokeTexture(), false);
+		this.add = new Particles(8000, glow, true);
+		this.smoke = new Particles(9000, smokeTexture(), false);
 		this.group.add(this.smoke.mesh, this.add.mesh);
 
 		const tm = new THREE.MeshBasicMaterial({ transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
@@ -307,6 +307,30 @@ export class Fx {
 
 	dust(x: number, y: number, z: number, size: number) {
 		this.smoke.spawn(x, y, z, rand(-1, 1), rand(0.3, 0.8), rand(-1, 1), rand(0.8, 1.4), size, size * 2.2, 0.5, 0.44, 0.34, 0.45, 0.55, 0.5, 0.4, 0, 1.5, 0);
+	}
+
+	/** Jet exhaust: a short hot plume behind the nozzle, (dx, dz) = flight direction. */
+	afterburner(x: number, y: number, z: number, dx: number, dz: number) {
+		this.add.spawn(x, y, z, -dx * 20, 0, -dz * 20, 0.09, 1.5, 0.5, 3.4, 1.9, 0.9, 1, 1.2, 0.35, 1.4, 0, 2);
+	}
+
+	/** A cannon round hitting the dirt: spark, kicked-up dust, no crater. */
+	bulletImpact(x: number, y: number, z: number) {
+		this.add.spawn(x, y + 0.3, z, 0, 0, 0, 0.07, 0.9, 1.6, 3.4, 2.6, 1.3, 1, 2, 1, 0.3, 0);
+		for (let k = 0; k < 2; k++)
+			this.smoke.spawn(x, y + 0.2, z, rand(-1.5, 1.5), rand(2, 5), rand(-1.5, 1.5), rand(0.7, 1.2), 0.6, 2.2, 0.5, 0.43, 0.32, 0.6, 0.55, 0.5, 0.4, 0, 2, -3);
+	}
+
+	/** A bare flash of light: glow sprite + a borrowed point light. */
+	flash(x: number, y: number, z: number, size: number, light = 0) {
+		this.add.spawn(x, y, z, 0, 0, 0, 0.35, size * 0.6, size, 5, 4.6, 4, 1, 3, 1.6, 0.6, 0);
+		if (light > 0) {
+			let l = this.lights[0];
+			for (const k of this.lights) if (k.intensity < l.intensity) l = k;
+			l.position.set(x, y, z);
+			l.intensity = light;
+			l.distance = size * 4;
+		}
 	}
 
 	/** Colour is HDR (values > 1 bloom). */
@@ -398,6 +422,12 @@ export class Fx {
 		this.hooks.sound('whoosh', sx, sz, 0.8);
 	}
 
+	/** A nuclear warhead coming down steep and fast under a white-hot trail. */
+	warhead(sx: number, sy: number, sz: number, tx: number, ty: number, tz: number, speed: number, hit: (x: number, z: number) => void) {
+		const dist = Math.hypot(tx - sx, ty - sy, tz - sz);
+		this.ords.push({ kind: 'warhead', x: sx, y: sy, z: sz, sx, sy, sz, tx, ty, tz, vx: 0, vy: 0, vz: 0, t: 0, T: dist / speed, apex: 0, trail: 0, hit });
+	}
+
 	bomb(x: number, y: number, z: number, vx: number, vz: number, hit: (x: number, z: number) => void) {
 		this.ords.push({ kind: 'bomb', x, y, z, sx: x, sy: y, sz: z, tx: 0, ty: 0, tz: 0, vx, vy: -2, vz, t: 0, T: 99, apex: 0, trail: 0, hit });
 	}
@@ -461,6 +491,15 @@ export class Fx {
 				done = u >= 1;
 				this.add.spawn(o.x, o.y, o.z, 0, 0, 0, 0.06, 1.3, 0.6, 3.2, 1.8, 0.6, 1, 2, 0.6, 0.1, 0);
 				if (Math.random() < 0.6) this.smoke.spawn(o.x, o.y, o.z, rand(-0.3, 0.3), rand(0, 0.5), rand(-0.3, 0.3), rand(1.4, 2.2), 0.7, 2.6, 0.78, 0.77, 0.74, 0.5, 0.85, 0.84, 0.82, 0, 1, 0.3);
+			} else if (o.kind === 'warhead') {
+				const u = Math.min(1, o.t / o.T);
+				o.x = o.sx + (o.tx - o.sx) * u;
+				o.y = o.sy + (o.ty - o.sy) * u;
+				o.z = o.sz + (o.tz - o.sz) * u;
+				done = u >= 1;
+				this.add.spawn(o.x, o.y, o.z, 0, 0, 0, 0.08, 4.5, 2, 5, 4.4, 3.6, 1, 3, 1.4, 0.4, 0);
+				for (let k = 0; k < 2; k++)
+					this.smoke.spawn(o.x + rand(-0.6, 0.6), o.y + rand(-0.6, 0.6), o.z + rand(-0.6, 0.6), rand(-0.4, 0.4), rand(-0.2, 0.4), rand(-0.4, 0.4), rand(4, 6), 1.6, 6, 0.95, 0.95, 0.94, 0.7, 0.9, 0.9, 0.9, 0, 0.5, 0.15);
 			} else if (o.kind === 'missile') {
 				const u = Math.min(1, o.t / o.T);
 				o.x = o.sx + (o.tx - o.sx) * u;

@@ -11,6 +11,7 @@ import { buildScenery } from './scenery';
 import { Army, BULL, BEAR, DIR } from './army';
 import { Air, type StrikeKind } from './air';
 import { Fx } from './fx';
+import { Nukes } from './nuke';
 import { CameraRig } from './camera';
 import { WarAudio } from './audio';
 import type { Forces } from '$lib/market/types';
@@ -56,6 +57,7 @@ export class Battlefield {
 	private scorch: W.ScorchPaint;
 	private army: Army;
 	private air: Air;
+	private nukes: Nukes;
 	private fx: Fx;
 	readonly audio = new WarAudio();
 
@@ -91,7 +93,7 @@ export class Battlefield {
 
 	constructor(
 		private canvas: HTMLCanvasElement,
-		private on: { round(e: RoundEvent): void; stats(s: BattleStats): void }
+		private on: { round(e: RoundEvent): void; stats(s: BattleStats): void; flash(strength: number): void }
 	) {
 		this.mobile = matchMedia('(pointer: coarse)').matches || innerWidth < 760;
 		this.infantry = this.mobile ? 640 : 1150;
@@ -158,8 +160,12 @@ export class Battlefield {
 			shot: (x, z) => this.audio.play('shot', x, z),
 			cannon: (x, z) => this.audio.play('cannon', x, z)
 		});
-		this.air = new Air(this.fx, this.army, { sound: (k, x, z) => this.audio.play(k, x, z) });
-		this.scene.add(this.army.group, this.air.group, this.fx.group);
+		this.air = new Air(this.fx, this.army, {
+			sound: (k, x, z) => this.audio.play(k, x, z),
+			nuke: (x, z, s, victims) => this.detonate(x, z, s, victims)
+		});
+		this.nukes = new Nukes(this.fx);
+		this.scene.add(this.army.group, this.air.group, this.fx.group, this.nukes.group);
 
 		this.label = this.makeLabel();
 		this.scene.add(this.label.mesh);
@@ -199,6 +205,7 @@ export class Battlefield {
 		this.price = 0;
 		this.army.clear();
 		this.air.clear();
+		this.nukes.clear();
 		this.fx.clear();
 		this.scorch.clear();
 		this.front = 0;
@@ -248,7 +255,21 @@ export class Battlefield {
 		if (this.phase === 'idle') return;
 		const s = attacker === 'bull' ? BULL : BEAR;
 		if (kind === 'barrage') this.army.barrage(s, Math.round(3 + 3 * scale));
-		else if (this.air.active < 10) this.air.strike(kind, s, scale);
+		else if (kind === 'nuke' || this.air.active < 12) this.air.strike(kind, s, scale);
+	}
+
+	/** A warhead landed: mushroom cloud, everything close in dies, the enemy further out. */
+	private detonate(x: number, z: number, scale: number, victims: number) {
+		const y = W.heightAt(x, z);
+		this.nukes.spawn(x, y, z, scale);
+		this.army.blast(x, z, 13 * scale, 1, -1);
+		this.army.blast(x, z, 32 * scale, 0.95, victims);
+		this.scorch.crater(x, z, 22 * scale);
+		this.scorch.crater(x, z, 12 * scale);
+		this.rig.jolt(3);
+		this.audio.play('nuke', x, z, scale);
+		const d = Math.hypot(x - this.rig.target.x, z - this.rig.target.z);
+		this.on.flash(Math.max(0.35, 1 - d / (this.rig.dist * 2.5)));
 	}
 
 	recenter() {
@@ -451,6 +472,7 @@ export class Battlefield {
 		this.army.volatility = this.vol;
 		if (this.phase !== 'idle') this.army.update(dt); // no one deploys before the first price
 		this.air.update(dt);
+		this.nukes.update(dt);
 		this.fx.update(dt);
 		this.scorch.update(now);
 

@@ -17,33 +17,45 @@ export const OSIRIS: Theater = {
 		const l = Math.max(5000, liq);
 		return {
 			squad: 0,
-			tank: Math.round(l * 0.001),
-			heli: Math.round(l * 0.0025),
-			jet: Math.round(l * 0.012),
-			bomber: Math.round(l * 0.05),
+			tank: Math.round(l * 0.0008),
+			heli: Math.round(l * 0.0015),
+			jet: Math.round(l * 0.005),
+			bomber: Math.round(l * 0.015),
+			nuke: Math.round(l * 0.04),
+			barrage: Infinity,
 			feed: 0
 		};
 	},
 	strikesFrom: 'trade'
 };
 
-// BTC: the Newhedge rules — $50 marker rows, liquidation-driven strikes at
-// $50K helicopter / $150K jet / $500K bombing run.
 const spot = (src: string) => {
 	const s = src.toUpperCase();
 	return s.endsWith('SPOT') ? s : `${s} SPOT`;
 };
 
-export const BTC: Theater = {
-	id: 'btc',
-	name: 'BTC',
-	pairLabel: (src) => `BTC/USD · ${spot(src)}`,
+// SOL: the Newhedge rules on Solana — a marker row every ~0.08% (10¢ at today's
+// price). Whale buy/sell bursts and perp liquidations both call in strikes; the
+// ladder is calibrated so quiet hours still see helicopters and busy ones jets.
+export const SOL: Theater = {
+	id: 'sol',
+	name: 'SOL',
+	pairLabel: (src) => `SOL/USD · ${spot(src)}`,
 	depthLabel: (src) => `${spot(src)} DEPTH`,
-	step: () => 50,
-	level: (v) => grouped(v),
+	step: (p) => niceStep(p * 0.0008),
+	level: (v) => grouped(v, 2),
 	price: (v) => '$' + grouped(v, 2),
-	tiers: () => ({ squad: 25_000, tank: 250_000, heli: 50_000, jet: 150_000, bomber: 500_000, feed: 25_000 }),
-	strikesFrom: 'liquidation'
+	tiers: () => ({
+		squad: 2_000,
+		tank: 15_000,
+		heli: 20_000,
+		jet: 50_000,
+		bomber: 120_000,
+		nuke: 400_000,
+		barrage: 3_000,
+		feed: 5_000
+	}),
+	strikesFrom: 'both'
 };
 
-export const THEATERS = { osiris: OSIRIS, btc: BTC } as const;
+export const THEATERS = { osiris: OSIRIS, sol: SOL } as const;

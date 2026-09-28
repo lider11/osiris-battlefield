@@ -1,6 +1,10 @@
-// BTC theater: live spot order books (Coinbase, Kraken, Binance), the trade tape,
+// SOL theater: live spot order books (Coinbase, Kraken, Binance), the trade tape,
 // and perp liquidations (Binance, Bybit, OKX) — all public WebSockets, straight
-// from the browser. Mirrors the Newhedge battlefield's inputs.
+// from the browser. Mirrors the Newhedge battlefield's inputs, for Solana.
+//
+// A big market order fills as a spray of small prints, so each venue's taker
+// prints are summed per side over one-second windows: the sum is the order that
+// hit the book, and that is what deploys armour and calls in strikes.
 
 import type { Depth, FeedHandlers, Forces, MarketFeed, Venue } from './types';
 import { LiveSocket, Rolling } from './socket';
@@ -9,8 +13,8 @@ type Book = { bids: Map<number, number>; asks: Map<number, number>; at: number }
 
 const BAND = 0.01; // ±1% of mid for walls + depth chart
 const BUCKETS = 64;
-const EMIT_TRADE = 25_000; // smaller prints only feed the flow meters
-const HEAVY = 100_000;
+const EMIT_TRADE = 2_000; // smaller one-second bursts only feed the flow meters (= the squad tier)
+const HEAVY = 15_000; // "heavy" flow = tank-sized bursts and up
 
 const newBook = (): Book => ({ bids: new Map(), asks: new Map(), at: 0 });
 
@@ -25,7 +29,7 @@ function bestAsk(b: Book) {
 	return m;
 }
 
-export class BtcFeed implements MarketFeed {
+export class SolFeed implements MarketFeed {
 	readonly sources = [
 		{ id: 'agg', label: 'Aggregated spot' },
 		{ id: 'binance', label: 'Binance' },
@@ -49,6 +53,7 @@ export class BtcFeed implements MarketFeed {
 	private heavySell = new Rolling(600_000);
 	private mids: { t: number; p: number }[] = [];
 	private lastQuote = 0;
+	private bursts = new Map<string, number>();
 
 	// Binance diff-depth needs a REST snapshot stitched onto the stream
 	private bnBuffer: any[] = [];
@@ -64,18 +69,18 @@ export class BtcFeed implements MarketFeed {
 		const cb = new LiveSocket('wss://ws-feed.exchange.coinbase.com', {
 			onOpen: (ws) =>
 				ws.send(
-					JSON.stringify({ type: 'subscribe', product_ids: ['BTC-USD'], channels: ['matches', 'ticker', 'level2_batch'] })
+					JSON.stringify({ type: 'subscribe', product_ids: ['SOL-USD'], channels: ['matches', 'ticker', 'level2_batch'] })
 				),
 			onMessage: (d) => this.coinbase(d)
 		});
 		const kr = new LiveSocket('wss://ws.kraken.com/v2', {
 			onOpen: (ws) => {
-				ws.send(JSON.stringify({ method: 'subscribe', params: { channel: 'book', symbol: ['BTC/USD'], depth: 1000 } }));
-				ws.send(JSON.stringify({ method: 'subscribe', params: { channel: 'trade', symbol: ['BTC/USD'] } }));
+				ws.send(JSON.stringify({ method: 'subscribe', params: { channel: 'book', symbol: ['SOL/USD'], depth: 1000 } }));
+				ws.send(JSON.stringify({ method: 'subscribe', params: { channel: 'trade', symbol: ['SOL/USD'] } }));
 			},
 			onMessage: (d) => this.kraken(d)
 		});
-		const bn = new LiveSocket('wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@depth@1000ms', {
+		const bn = new LiveSocket('wss://stream.binance.com:9443/stream?streams=solusdt@aggTrade/solusdt@depth@1000ms', {
 			onOpen: () => {
 				this.bnSynced = false;
 				this.bnBuffer = [];
@@ -84,7 +89,7 @@ export class BtcFeed implements MarketFeed {
 			onMessage: (d) => this.binance(d),
 			maxTries: 6
 		});
-		const bnLiq = new LiveSocket('wss://fstream.binance.com/ws/btcusdt@forceOrder', {
+		const bnLiq = new LiveSocket('wss://fstream.binance.com/ws/solusdt@forceOrder', {
 			onMessage: (d) => {
 				const o = d?.o;
 				if (!o) return;
@@ -95,7 +100,7 @@ export class BtcFeed implements MarketFeed {
 			maxTries: 6
 		});
 		const bybit = new LiveSocket('wss://stream.bybit.com/v5/public/linear', {
-			onOpen: (ws) => ws.send(JSON.stringify({ op: 'subscribe', args: ['allLiquidation.BTCUSDT'] })),
+			onOpen: (ws) => ws.send(JSON.stringify({ op: 'subscribe', args: ['allLiquidation.SOLUSDT'] })),
 			onMessage: (d) => {
 				if (!Array.isArray(d?.data)) return;
 				for (const l of d.data) this.liquidation(l.S === 'Buy' ? 'long' : 'short', Number(l.v) * Number(l.p), 'Bybit');
@@ -110,10 +115,11 @@ export class BtcFeed implements MarketFeed {
 				if (!Array.isArray(d?.data)) return;
 				for (const inst of d.data) {
 					const fam = inst.instFamily || inst.uly;
-					if (fam !== 'BTC-USDT' && fam !== 'BTC-USD') continue;
+					if (fam !== 'SOL-USDT' && fam !== 'SOL-USD') continue;
 					for (const x of inst.details || []) {
 						const sz = Number(x.sz);
-						const usd = fam === 'BTC-USD' ? sz * 100 : sz * 0.01 * Number(x.bkPx);
+						// SOL-USD-SWAP contracts are $10; SOL-USDT-SWAP contracts are 1 SOL
+						const usd = fam === 'SOL-USD' ? sz * 10 : sz * Number(x.bkPx);
 						const long = x.posSide === 'long' || (x.posSide !== 'short' && x.side === 'sell');
 						this.liquidation(long ? 'long' : 'short', usd, 'OKX');
 					}
@@ -127,12 +133,13 @@ export class BtcFeed implements MarketFeed {
 
 		this.timers.push(setInterval(() => this.emitQuote(), 250));
 		this.timers.push(setInterval(() => this.emitDepth(), 1000));
+		this.timers.push(setInterval(() => this.flushBursts(), 1000));
 		// networks that block WebSockets still get a live price over REST
 		this.timers.push(
 			setInterval(async () => {
 				if (cb.up || kr.up || bn.up) return;
 				try {
-					const r = await fetch('https://api.exchange.coinbase.com/products/BTC-USD/ticker');
+					const r = await fetch('https://api.exchange.coinbase.com/products/SOL-USD/ticker');
 					if (r.ok) this.lastTrade = Number((await r.json()).price) || this.lastTrade;
 				} catch {
 					/* keep waiting */
@@ -168,7 +175,7 @@ export class BtcFeed implements MarketFeed {
 	// ── venues ──────────────────────────────────────────────────────────
 
 	private coinbase(d: any) {
-		if (d.product_id !== 'BTC-USD') return;
+		if (d.product_id !== 'SOL-USD') return;
 		const b = this.books.coinbase;
 		if (d.type === 'snapshot') {
 			b.bids.clear();
@@ -258,7 +265,7 @@ export class BtcFeed implements MarketFeed {
 	private async binanceSnapshot() {
 		this.bnSnapshotPending = true;
 		try {
-			const r = await fetch('https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000');
+			const r = await fetch('https://api.binance.com/api/v3/depth?symbol=SOLUSDT&limit=5000');
 			if (!r.ok) {
 				if (r.status === 451 || r.status === 403) this.bnBlocked = true;
 				return;
@@ -292,8 +299,18 @@ export class BtcFeed implements MarketFeed {
 	private trade(side: 'buy' | 'sell', usd: number, venue: Venue) {
 		if (!(usd > 0)) return;
 		(side === 'buy' ? this.flowBuy : this.flowSell).add(usd);
-		if (usd >= HEAVY) (side === 'buy' ? this.heavyBuy : this.heavySell).add(usd);
-		if (usd >= EMIT_TRADE) this.h.event({ type: 'trade', side, usd, venue, ts: Date.now() });
+		const k = `${venue}|${side}`;
+		this.bursts.set(k, (this.bursts.get(k) ?? 0) + usd);
+	}
+
+	/** Once a second: each venue's summed taker prints per side become one order. */
+	private flushBursts() {
+		for (const [k, usd] of this.bursts) {
+			const [venue, side] = k.split('|') as [Venue, 'buy' | 'sell'];
+			if (usd >= HEAVY) (side === 'buy' ? this.heavyBuy : this.heavySell).add(usd);
+			if (usd >= EMIT_TRADE) this.h.event({ type: 'trade', side, usd, venue, ts: Date.now() });
+		}
+		this.bursts.clear();
 	}
 
 	private liquidation(side: 'long' | 'short', usd: number, venue: Venue) {
@@ -378,7 +395,7 @@ export class BtcFeed implements MarketFeed {
 				lo = Math.min(lo, m.p);
 				hi = Math.max(hi, m.p);
 			}
-			vol = Math.min(1, (hi - lo) / mid / 0.0015);
+			vol = Math.min(1, (hi - lo) / mid / 0.003);
 		}
 		const forces: Forces = {
 			bidWall: cb,

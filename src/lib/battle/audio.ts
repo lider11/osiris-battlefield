@@ -2,7 +2,7 @@
 // triggered by a real battlefield event and attenuated by its distance from the
 // camera. Starts off (browsers need a click to allow audio anyway).
 
-export type SoundKind = 'shot' | 'cannon' | 'boom' | 'rocket' | 'whoosh' | 'heli' | 'jet' | 'bomber' | 'victory' | 'round';
+export type SoundKind = 'shot' | 'cannon' | 'boom' | 'rocket' | 'whoosh' | 'gun' | 'heli' | 'jet' | 'bomber' | 'siren' | 'nuke' | 'victory' | 'round';
 
 export class WarAudio {
 	private ctx: AudioContext | null = null;
@@ -80,7 +80,8 @@ export class WarAudio {
 		if (!this.enabled || !this.ctx || !this.master || !this.noise) return;
 		const ctx = this.ctx;
 		const t = ctx.currentTime;
-		let v = kind === 'victory' || kind === 'round' ? 1 : this.level(x, z);
+		// announcements carry across the whole field; a nuke is heard everywhere
+		let v = kind === 'victory' || kind === 'round' || kind === 'siren' ? 1 : kind === 'nuke' ? Math.max(0.7, this.level(x, z)) : this.level(x, z);
 		if (v < 0.03) return;
 		if (kind === 'shot') {
 			// rifle fire is rate-limited so a big firefight crackles instead of roaring
@@ -193,6 +194,56 @@ export class WarAudio {
 				p.pan.setValueAtTime(-0.7, t);
 				p.pan.linearRampToValueAtTime(0.7, t + 3.2);
 				bed(f, [[1.3, 1], [3.6, 0.0008]], 3.8);
+				break;
+			}
+			case 'gun': {
+				// rotary cannon: a fast buzz of rounds
+				out.gain.value = 0.45 * Math.max(0.3, v);
+				const o = ctx.createOscillator();
+				o.type = 'sawtooth';
+				o.frequency.value = 68;
+				const f = ctx.createBiquadFilter();
+				f.type = 'bandpass';
+				f.frequency.value = 900;
+				f.Q.value = 0.7;
+				const g = ctx.createGain();
+				g.gain.setValueAtTime(0.0001, t);
+				g.gain.exponentialRampToValueAtTime(1, t + 0.04);
+				g.gain.setValueAtTime(1, t + 1.1);
+				g.gain.exponentialRampToValueAtTime(0.0008, t + 1.35);
+				o.connect(f).connect(g).connect(out);
+				o.start(t);
+				o.stop(t + 1.4);
+				noise(1.3, 'bandpass', 1800, 900, 0.9);
+				break;
+			}
+			case 'siren': {
+				// air-raid siren: two slow wails
+				out.gain.value = 0.16;
+				const o = ctx.createOscillator();
+				o.type = 'triangle';
+				o.frequency.setValueAtTime(380, t);
+				o.frequency.linearRampToValueAtTime(880, t + 0.8);
+				o.frequency.linearRampToValueAtTime(520, t + 1.3);
+				o.frequency.linearRampToValueAtTime(880, t + 2.0);
+				o.frequency.linearRampToValueAtTime(360, t + 2.8);
+				const g = ctx.createGain();
+				g.gain.setValueAtTime(0.0001, t);
+				g.gain.exponentialRampToValueAtTime(1, t + 0.3);
+				g.gain.setValueAtTime(1, t + 2.3);
+				g.gain.exponentialRampToValueAtTime(0.0008, t + 2.9);
+				o.connect(g).connect(out);
+				o.start(t);
+				o.stop(t + 3);
+				break;
+			}
+			case 'nuke': {
+				// the crack, then a long rolling roar under a sub-bass drop
+				out.gain.value = Math.min(1, 0.9 * v);
+				noise(0.5, 'highpass', 3000, 400, 0.5);
+				noise(5.5, 'lowpass', 2600, 45, 0.5);
+				tone(4.5, 'sine', 44, 14, 1);
+				tone(3, 'triangle', 70, 22, 0.5);
 				break;
 			}
 			case 'heli': {

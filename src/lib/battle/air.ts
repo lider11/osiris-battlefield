@@ -1,6 +1,9 @@
-// Air strikes, the battlefield's big events: a helicopter rocket strike, a jet
-// strike, and a bombing run, each flown in from the attacker's side and aimed at
-// the densest stretch of the enemy's front.
+// Air strikes, the battlefield's big events, from the attacker's side onto the
+// densest stretch of the enemy's front:
+//   heli    — chin-gun burst, then a rocket ripple from a hover
+//   jet     — afterburning pair (or trio) strafes the line with cannon, then missiles
+//   bomber  — a bomber formation carpet-bombs along the line, fighters escorting
+//   nuke    — a warhead comes down white-hot from high altitude: mushroom cloud
 
 import * as THREE from 'three';
 import * as M from './models';
@@ -8,27 +11,34 @@ import type { Fx } from './fx';
 import { type Army, DIR } from './army';
 import { heightAt, BASE_X, MINZ, MAXZ, MINX, MAXX, clampZ } from './world';
 
-export type StrikeKind = 'heli' | 'jet' | 'bomber';
+export type StrikeKind = 'heli' | 'jet' | 'bomber' | 'nuke';
+type CraftKind = 'heli' | 'jet' | 'bomber';
 
 type Craft = {
-	kind: StrikeKind;
+	kind: CraftKind;
 	side: number;
 	obj: THREE.Object3D;
 	rotor?: THREE.Object3D;
 	t: number;
+	delay: number; // seconds before it enters (escorts time their arrival)
 	phase: number;
 	x: number; y: number; z: number;
 	vx: number; vy: number; vz: number;
 	yaw: number; bank: number; pitch: number;
 	tx: number; tz: number;
 	hx: number; hz: number; hy: number;
-	shots: number; shotT: number; fired: boolean; scale: number;
+	shots: number; gun: number; shotT: number; gunT: number; fired: boolean; strafing: boolean; scale: number;
 };
 
-export type AirHooks = { sound(kind: StrikeKind, x: number, z: number): void };
+export type AirHooks = {
+	sound(kind: CraftKind | 'gun' | 'siren', x: number, z: number): void;
+	/** A warhead reached the ground. */
+	nuke(x: number, z: number, scale: number, victims: number): void;
+};
 
 const rand = (a: number, b: number) => a + Math.random() * (b - a);
 const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+const JET_SPEED = 125;
 
 export class Air {
 	readonly group = new THREE.Group();
@@ -47,6 +57,7 @@ export class Air {
 		new THREE.MeshStandardMaterial({ vertexColors: true, color: '#9a7f7c', roughness: 0.55, flatShading: true })
 	];
 	private rotorMat = new THREE.MeshStandardMaterial({ vertexColors: true, color: '#2a2a2a', roughness: 0.6 });
+	private warheads = 0;
 
 	constructor(
 		private fx: Fx,
@@ -55,7 +66,7 @@ export class Air {
 	) {}
 
 	get active() {
-		return this.crafts.length;
+		return this.crafts.length + this.warheads;
 	}
 
 	clear() {
@@ -68,10 +79,11 @@ export class Air {
 		const target = at ?? this.army.strikePoint(1 - side);
 		if (kind === 'heli') this.heli(side, target, scale);
 		else if (kind === 'jet') this.jets(side, target, scale);
-		else this.bombers(side, target, scale);
+		else if (kind === 'bomber') this.bombers(side, target, scale);
+		else this.nuke(side, target, scale);
 	}
 
-	private make(kind: StrikeKind, side: number): { obj: THREE.Object3D; rotor?: THREE.Object3D } {
+	private make(kind: CraftKind, side: number): { obj: THREE.Object3D; rotor?: THREE.Object3D } {
 		if (kind === 'heli') {
 			const obj = new THREE.Group();
 			const body = new THREE.Mesh(this.heliGeo, this.heliMat[side]);
@@ -92,6 +104,7 @@ export class Air {
 		const { obj, rotor } = this.make(c.kind, c.side);
 		const craft: Craft = { ...c, obj, rotor };
 		obj.position.set(c.x, c.y, c.z);
+		obj.visible = c.delay <= 0;
 		this.group.add(obj);
 		this.crafts.push(craft);
 		return craft;
@@ -99,8 +112,8 @@ export class Air {
 
 	private base(): Omit<Craft, 'obj' | 'rotor' | 'kind' | 'side'> {
 		return {
-			t: 0, phase: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, bank: 0, pitch: 0,
-			tx: 0, tz: 0, hx: 0, hz: 0, hy: 0, shots: 0, shotT: 0, fired: false, scale: 1
+			t: 0, delay: 0, phase: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, bank: 0, pitch: 0,
+			tx: 0, tz: 0, hx: 0, hz: 0, hy: 0, shots: 0, gun: 0, shotT: 0, gunT: 0, fired: false, strafing: false, scale: 1
 		};
 	}
 
@@ -112,28 +125,28 @@ export class Air {
 		const z = clampZ(T.z + rand(-50, 50));
 		this.add({
 			...this.base(), kind: 'heli', side, x, y: 26, z, tx: T.x, tz: T.z, hx, hz,
-			hy: heightAt(hx, hz) + 15, yaw: Math.atan2(-(hz - z), hx - x), shots: Math.round(6 + 4 * scale), scale
+			hy: heightAt(hx, hz) + 15, yaw: Math.atan2(-(hz - z), hx - x), shots: Math.round(6 + 4 * scale), gun: 18, scale
 		});
 		this.hooks.sound('heli', x, z);
 	}
 
-	private jets(side: number, T: { x: number; z: number }, scale: number) {
+	private jets(side: number, T: { x: number; z: number }, scale: number, delay = 0) {
 		const dir = DIR[side];
 		const n = scale > 1.6 ? 3 : 2;
 		const angle = rand(-0.35, 0.35);
-		const vx = -dir * Math.cos(angle) * 125;
-		const vz = Math.sin(angle) * 125;
+		const vx = -dir * Math.cos(angle) * JET_SPEED;
+		const vz = Math.sin(angle) * JET_SPEED;
 		for (let k = 0; k < n; k++) {
 			const off = (k - (n - 1) / 2) * 9;
 			const lag = Math.abs(k - (n - 1) / 2) * 14;
-			const sx = T.x - (vx / 125) * (330 + lag);
-			const sz = T.z - (vz / 125) * (330 + lag) + off;
+			const sx = T.x - (vx / JET_SPEED) * (360 + lag);
+			const sz = T.z - (vz / JET_SPEED) * (360 + lag) + off;
 			this.add({
-				...this.base(), kind: 'jet', side, x: sx, y: 40 + k * 2, z: sz, vx, vy: 0, vz,
+				...this.base(), kind: 'jet', side, delay, x: sx, y: 38 + k * 2, z: sz, vx, vy: 0, vz,
 				tx: T.x + rand(-6, 6), tz: T.z + off * 0.6, yaw: Math.atan2(-vz, vx), scale
 			});
 		}
-		this.hooks.sound('jet', T.x, T.z);
+		if (delay <= 0) this.hooks.sound('jet', T.x, T.z);
 	}
 
 	private bombers(side: number, T: { x: number; z: number }, scale: number) {
@@ -150,11 +163,34 @@ export class Air {
 			});
 		}
 		this.hooks.sound('bomber', lane, 0);
+		// fighter escort sweeps the line as the bombers arrive
+		this.jets(side, this.army.strikePoint(1 - side), 1, 3.2);
+	}
+
+	private nuke(side: number, T: { x: number; z: number }, scale: number) {
+		const dir = DIR[side];
+		// aim a little deeper into enemy ground so the blast is theirs
+		const tx = Math.min(MAXX - 20, Math.max(MINX + 20, T.x - dir * 16));
+		const tz = clampZ(T.z);
+		const sx = tx + dir * 250;
+		const sz = tz + rand(-90, 90);
+		this.warheads++;
+		this.hooks.sound('siren', tx, tz);
+		this.fx.warhead(sx, 340, sz, tx, heightAt(tx, tz), tz, 150, (x, z) => {
+			this.warheads--;
+			this.hooks.nuke(x, z, scale, 1 - side);
+		});
 	}
 
 	update(dt: number) {
 		for (let i = this.crafts.length - 1; i >= 0; i--) {
 			const c = this.crafts[i];
+			if (c.delay > 0) {
+				c.delay -= dt;
+				if (c.delay > 0) continue;
+				c.obj.visible = true;
+				if (c.kind === 'jet') this.hooks.sound('jet', c.tx, c.tz);
+			}
 			c.t += dt;
 			let gone = false;
 			if (c.kind === 'heli') gone = this.flyHeli(c, dt);
@@ -167,6 +203,15 @@ export class Air {
 				this.crafts.splice(i, 1);
 			}
 		}
+	}
+
+	/** A cannon round from (sx, sy, sz) raking a spot on the ground. */
+	private round(sx: number, sy: number, sz: number, ax: number, az: number, victims: number, speed = 520) {
+		const ay = heightAt(ax, az);
+		this.fx.tracer(sx, sy, sz, ax, ay + 0.2, az, 3.4, 2.9, 1.5, speed, 7, 0.15, () => {
+			this.fx.bulletImpact(ax, ay, az);
+			this.army.blast(ax, az, 1.9, 0.55, victims);
+		});
 	}
 
 	private flyHeli(c: Craft, dt: number): boolean {
@@ -187,26 +232,32 @@ export class Air {
 			c.pitch += (-0.22 * Math.min(1, sp / 38) - c.pitch) * Math.min(1, dt * 3);
 			if (d < 3) {
 				c.phase = 1;
-				c.shotT = 0.4;
+				c.shotT = 1.1; // chin gun opens up first
 			}
 		} else if (c.phase === 1) {
 			const want = Math.atan2(-(c.tz - c.z), c.tx - c.x);
 			c.yaw += wrap(want - c.yaw) * Math.min(1, dt * 3);
 			c.pitch += (0.06 - c.pitch) * Math.min(1, dt * 3);
 			c.y += Math.sin(c.t * 2) * 0.02;
+			const cy = Math.cos(c.yaw);
+			const sy = Math.sin(c.yaw);
+			const victims = 1 - c.side;
+			c.gunT -= dt;
+			if (c.gun > 0 && c.gunT <= 0) {
+				c.gun--;
+				c.gunT = 0.06;
+				this.round(c.x + cy * 2.6, c.y - 1, c.z - sy * 2.6, c.tx + rand(-6, 6), c.tz + rand(-6, 6), victims, 300);
+			}
 			c.shotT -= dt;
 			if (c.shotT <= 0 && c.shots > 0) {
 				c.shots--;
 				c.shotT = 0.28;
 				const side = c.shots % 2 ? 1.7 : -1.7;
-				const cy = Math.cos(c.yaw);
-				const sy = Math.sin(c.yaw);
 				// pod positions in the heli frame, rotated into the world
 				const px = c.x + cy * 1.2 + sy * side;
 				const pz = c.z - sy * 1.2 + cy * side;
 				const tx = c.tx + rand(-8, 8);
 				const tz = c.tz + rand(-8, 8);
-				const victims = 1 - c.side;
 				const s = 0.95 * c.scale;
 				this.fx.missile(px, c.y - 0.6, pz, tx, heightAt(tx, tz) + 0.3, tz, 85, () => this.army.impact(tx, tz, s, victims));
 			}
@@ -231,12 +282,30 @@ export class Air {
 		c.x += c.vx * dt;
 		c.y += c.vy * dt;
 		c.z += c.vz * dt;
-		const dir = DIR[c.side];
+		const fx = c.vx / JET_SPEED;
+		const fz = c.vz / JET_SPEED;
+		const victims = 1 - c.side;
 		// distance still to run to the target, along the flight path
-		const ahead = ((c.tx - c.x) * c.vx + (c.tz - c.z) * c.vz) / 125;
+		const ahead = (c.tx - c.x) * fx + (c.tz - c.z) * fz;
+
+		// strafing run: cannon walks its impacts up the enemy line toward the target
+		if (ahead < 185 && ahead > 88) {
+			if (!c.strafing) {
+				c.strafing = true;
+				this.hooks.sound('gun', c.x, c.z);
+			}
+			c.gunT -= dt;
+			while (c.gunT <= 0) {
+				c.gunT += 0.035;
+				const p = (185 - ahead) / 97;
+				const along = -40 + 46 * p;
+				const lat = rand(-2.8, 2.8);
+				this.round(c.x + fx * 5, c.y - 0.8, c.z + fz * 5, c.tx + fx * along - fz * lat, c.tz + fz * along + fx * lat, victims);
+			}
+			c.pitch += (-0.1 - c.pitch) * Math.min(1, dt * 3); // nose down on the gun run
+		}
 		if (!c.fired && ahead < 85) {
 			c.fired = true;
-			const victims = 1 - c.side;
 			const s = 1.6 * c.scale;
 			for (let k = 0; k < 2; k++) {
 				const tx = c.tx + rand(-9, 9);
@@ -249,15 +318,29 @@ export class Air {
 			}
 		}
 		if (c.fired && ahead < 0) {
-			c.vy = Math.min(40, c.vy + 30 * dt);
-			c.pitch += (0.35 - c.pitch) * Math.min(1, dt * 2);
+			// pull up hard and roll away, pulling vapour off the wings
+			c.vy = Math.min(46, c.vy + 34 * dt);
+			c.pitch += (0.42 - c.pitch) * Math.min(1, dt * 2.2);
+			c.bank += (DIR[c.side] * 0.9 - c.bank) * Math.min(1, dt * 1.5);
+		} else if (!c.strafing) {
+			c.bank = Math.sin(c.t * 0.9 + DIR[c.side]) * 0.08;
 		}
-		c.bank = Math.sin(c.t * 0.9 + dir) * 0.08;
-		// contrails off the wingtips
 		const cy = Math.cos(c.yaw);
 		const sy = Math.sin(c.yaw);
-		for (const w of [-4.2, 4.2]) this.fx.puff(c.x - cy * 1.5 + sy * w, c.y, c.z + sy * 1.5 + cy * w, 0.5, 0.92, 0.35, 2.6);
-		return c.x > MAXX + 360 || c.x < MINX - 360 || c.z > MAXZ + 360 || c.z < MINZ - 360;
+		// afterburner at the nozzle
+		this.fx.afterburner(c.x - cy * 5.1, c.y, c.z + sy * 5.1, fx, fz);
+		// contrails off the wingtips, thicker while pulling
+		const pulling = c.fired && ahead < 0;
+		// several puffs per frame along the path this frame covered, so the trail is continuous
+		const stepX = c.vx * dt;
+		const stepY = c.vy * dt;
+		const stepZ = c.vz * dt;
+		for (let k = 0; k < 3; k++) {
+			const back = k / 3;
+			for (const w of [-6.2, 6.2])
+				this.fx.puff(c.x - stepX * back - cy * 2.5 + sy * w, c.y - stepY * back, c.z - stepZ * back + sy * 2.5 + cy * w, pulling ? 0.8 : 0.55, 0.94, pulling ? 0.45 : 0.3, 2.4);
+		}
+		return c.x > MAXX + 380 || c.x < MINX - 380 || c.z > MAXZ + 380 || c.z < MINZ - 380 || c.y > 200;
 	}
 
 	private flyBomber(c: Craft, dt: number): boolean {

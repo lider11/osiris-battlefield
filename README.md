@@ -2,9 +2,11 @@
 
 # ☥ OSIRIS Battlefield
 
-**The live $OSIRIS market as a real-time 3D war.**
+### [osirisai.live ↗](https://www.osirisai.live/)
 
-The front line sits on the real market cap. Pool depth and the trade tape field the armies. Whale trades call in air strikes.
+**The live $OSIRIS and SOL markets as a real-time 3D war.**
+
+The front line sits on the live price. Depth and the trade tape field the armies. Every whale buy and sell calls in air power: helicopters, jet gun runs, bombing runs, and for the biggest orders a tiny nuke with a mushroom cloud.
 
 [![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?logo=svelte&logoColor=white)](https://kit.svelte.dev)
 [![three.js](https://img.shields.io/badge/three.js-WebGL-000000?logo=three.js&logoColor=white)](https://threejs.org)
@@ -31,16 +33,21 @@ $OSIRIS trades against SOL in a PumpSwap constant-product pool, so its USD marke
 
 ## Forces
 
-| On the field | What it represents | $OSIRIS trigger | BTC trigger |
+| On the field | What it represents | $OSIRIS trigger | SOL trigger |
 | --- | --- | --- | --- |
-| 🪖 **Infantry** | Broad participation near the front | Army split from pool depth + last-hour buy/sell flow; **every trade sends a squad** | Book walls ±1% + 60s taker flow; trades ≥ $25K send a squad |
-| 🛡 **Tanks** | Heavier pressure | Trades ≥ 0.1% of pool liquidity | Trades ≥ $250K |
-| 🚀 **Rocket launchers** | Artillery behind the line, firing salvos as volatility rises | Volatility (1h change + SOL range) | 60s price range; liquidations ≥ $10K fire a barrage |
-| 🚁 **Helicopter strike** | Rocket strike on the enemy front | Trade ≥ 0.25% of liquidity | Liquidation ≥ $50K |
-| ✈️ **Jet strike** | Missile run, heavier blasts | Trade ≥ 1.2% of liquidity | Liquidation ≥ $150K |
-| 💣 **Bombing run** | Bomber formation carpet-bombs the line | Trade ≥ 5% of liquidity | Liquidation ≥ $500K |
+| 🪖 **Infantry** | Broad participation near the front | Army split from pool depth + last-hour buy/sell flow; **every trade sends a squad** | Book walls ±1% + 60s taker flow; orders ≥ $2K send a squad |
+| 🛡 **Tanks** | Heavier pressure | Trades ≥ 0.08% of pool liquidity | Orders ≥ $15K |
+| 🚀 **Rocket launchers** | Artillery behind the line, firing salvos as volatility rises | Volatility (1h change + SOL range) | 60s price range; liquidations ≥ $3K fire a barrage |
+| 🚁 **Helicopter strike** | Chin-gun burst, then a rocket ripple from a hover | Trade ≥ 0.15% of liquidity | Order or liquidation ≥ $20K |
+| ✈️ **Jet strike** | Afterburning jets strafe the line with cannon, then fire missiles and pull up | Trade ≥ 0.5% of liquidity | ≥ $50K |
+| 💣 **Bombing run** | Bomber formation carpet-bombs the line under a fighter escort | Trade ≥ 1.5% of liquidity | ≥ $120K |
+| ☢️ **Tactical nuke** | Siren, a white-hot warhead from the sky, flash, mushroom cloud, base surge | Trade ≥ 4% of liquidity | ≥ $400K |
 
-A buy (or a liquidated short) is flown by the Bulls against the Bears; a sell (or a liquidated long) by the Bears against the Bulls. The $OSIRIS tiers scale with pool liquidity, so a whale stays a whale as the pool grows. Explosions, smoke, craters and camera shake all scale with the size of the event.
+A buy (or a liquidated short) is flown by the Bulls against the Bears; a sell (or a liquidated long) by the Bears against the Bulls. On SOL, an "order" is one venue's taker prints summed per side over a second, since a big market order fills as a spray of small prints. The $OSIRIS tiers scale with pool liquidity, so a whale stays a whale as the pool grows. Explosions, smoke, craters and camera shake all scale with the size of the event.
+
+<img src="docs/nuke.png" alt="A tactical nuke: glowing mushroom cloud over the Bear line" width="900" />
+
+<img src="docs/jets.png" alt="A jet strike: three afterburning jets strafing the line with cannon" width="900" />
 
 <img src="docs/front.png" alt="Close-up of the front: toy-soldier infantry, tanks, tracers and the current market cap painted on the ground" width="900" />
 
@@ -48,17 +55,19 @@ A buy (or a liquidated short) is flown by the Bulls against the Bears; a sell (o
 
 ## Two theaters
 
-**$OSIRIS** is the default. Switch to **BTC** in the top-left (or open `/?m=btc`) for the full order-book version: aggregated **Coinbase + Kraken + Binance** spot books, with a source picker for each venue, plus the tape and perp liquidations from Binance, Bybit and OKX. It all streams over public WebSockets straight from the browser, with a REST price fallback on networks that block them.
+**$OSIRIS** is the default. Switch to **SOL** in the top-left (or open `/?m=sol`) for the full order-book version on Solana: aggregated **Coinbase + Kraken + Binance** SOL spot books, with a source picker for each venue, plus the tape and SOL perp liquidations from Binance, Bybit and OKX. It all streams over public WebSockets straight from the browser, with a REST price fallback on networks that block them.
 
-<img src="docs/btc.png" alt="The BTC theater: aggregated spot depth, buy and sell walls, live liquidations in the market feed" width="900" />
+<img src="docs/sol.png" alt="The SOL theater: aggregated spot depth, buy and sell walls, whale buys and sells in the market feed" width="900" />
 
 ## The HUD
 
 - **Price**, tick change, and 24h change, with the source it comes from.
 - **Market pressure:** *Buyers advancing*, *Sellers advancing* or *Holding the line*, plus the last meaningful event.
-- **Sell wall / Buy wall:** liquidity within the band (±10% of market cap for the $OSIRIS pool, ±1% for BTC books).
+- **Sell wall / Buy wall:** liquidity within the band (±10% of market cap for the $OSIRIS pool, ±1% for the SOL books).
 - **Order book depth chart**, cumulative bids vs asks.
-- **Market feed:** trades (click through to Solscan for $OSIRIS), liquidations, air strikes, new battles and victories.
+- **Market feed:** trades (click through to Solscan for $OSIRIS), liquidations, air strikes, nukes, new battles and victories.
+- **☢ NUKE INBOUND** alert when a warhead is on its way, and a white-out on detonation.
+- The gold bar across the top links to [osirisai.live](https://www.osirisai.live/).
 - **Round bar:** the current range, where the front sits inside it, and the Bulls–Bears score.
 
 <img src="docs/victory.png" alt="Victory: the Bulls break through the end zone and roll toward the Bear base" width="900" />
@@ -102,7 +111,8 @@ src/
 │   │   │                #   front line), painted price ladder, craters, road, lakes
 │   │   ├── army.ts      # instanced infantry (3 poses/side), tanks, rocket trucks,
 │   │   │                #   firefights with lethal tracers, blasts, skulls
-│   │   ├── air.ts       # helicopter / jet / bomber strikes
+│   │   ├── air.ts       # helicopter / jet / bomber strikes, nuke delivery
+│   │   ├── nuke.ts      # mushroom cloud: noise-displaced, shader-lit cap, stem, surge
 │   │   ├── fx.ts        # billboard particles, tracers, shockwaves, ordnance
 │   │   ├── models.ts    # procedural low-poly toy soldiers, armour, aircraft, scenery
 │   │   ├── scenery.ts   # forests, villages, HQ compounds and signs
@@ -110,7 +120,7 @@ src/
 │   │   └── audio.ts     # synthesized battle audio
 │   ├── market/
 │   │   ├── osiris.ts    # PumpSwap pool × live SOL/USD, x·y=k depth, trade tape
-│   │   ├── btc.ts       # Coinbase/Kraken/Binance books, trades, liquidations
+│   │   ├── sol.ts       # SOL: Coinbase/Kraken/Binance books, whale bursts, liquidations
 │   │   └── theaters.ts  # how each market maps onto the field
 │   └── server/osiris.ts # mint + pool config
 └── routes/
