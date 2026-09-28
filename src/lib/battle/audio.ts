@@ -1,296 +1,236 @@
-// Fully synthesized battle audio — no asset files. WebAudio only.
-// Every sound is driven by a real battle event: the drums follow the war phase
-// (and beat in step with the march animation), clashes ring only when warriors
-// actually die, volleys whoosh when the archers actually loose, and whale
-// strikes get their own comet/beam voices. No constant drone, no random noise.
+// Fully synthesized battle audio — WebAudio only, no asset files. Every sound is
+// triggered by a real battlefield event and attenuated by its distance from the
+// camera. Starts off (browsers need a click to allow audio anyway).
 
-import type { WarPhase } from './engine';
+export type SoundKind = 'shot' | 'cannon' | 'boom' | 'rocket' | 'whoosh' | 'heli' | 'jet' | 'bomber' | 'victory' | 'round';
 
 export class WarAudio {
 	private ctx: AudioContext | null = null;
 	private master: GainNode | null = null;
 	private noise: AudioBuffer | null = null;
-	private started = false;
-	muted = false;
+	enabled = false;
+	private lx = 0;
+	private lz = 0;
+	private ld = 300;
+	private shots: number[] = [];
 
-	// battle state fed from the engine's stats stream
-	private phase: WarPhase = 'form';
-	private intensity = 0; // 0..1 — how thick the fighting is
-	private beatTimer: ReturnType<typeof setTimeout> | null = null;
-	private beat = 0;
-	private lastKill = 0;
+	setEnabled(on: boolean) {
+		this.enabled = on;
+		if (on && !this.ctx) this.init();
+		if (!this.ctx || !this.master) return;
+		if (on) this.ctx.resume();
+		this.master.gain.setTargetAtTime(on ? 0.85 : 0, this.ctx.currentTime, 0.12);
+	}
 
-	private ensure() {
-		if (this.ctx) return;
-		this.ctx = new AudioContext();
-		this.master = this.ctx.createGain();
-		this.master.gain.value = 0.9;
-		this.master.connect(this.ctx.destination);
-		// one-shot noise buffer
-		const len = this.ctx.sampleRate * 1.5;
-		this.noise = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+	setListener(x: number, z: number, dist: number) {
+		this.lx = x;
+		this.lz = z;
+		this.ld = dist;
+	}
+
+	private init() {
+		const ctx = new AudioContext();
+		this.ctx = ctx;
+		const comp = ctx.createDynamicsCompressor();
+		comp.threshold.value = -16;
+		comp.ratio.value = 5;
+		comp.connect(ctx.destination);
+		this.master = ctx.createGain();
+		this.master.gain.value = 0;
+		this.master.connect(comp);
+		const len = ctx.sampleRate * 2;
+		this.noise = ctx.createBuffer(1, len, ctx.sampleRate);
 		const d = this.noise.getChannelData(0);
 		for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+		// distant battle rumble: low noise, slowly breathing
+		const src = ctx.createBufferSource();
+		src.buffer = this.noise;
+		src.loop = true;
+		const lp = ctx.createBiquadFilter();
+		lp.type = 'lowpass';
+		lp.frequency.value = 110;
+		const amb = ctx.createGain();
+		amb.gain.value = 0.16;
+		const lfo = ctx.createOscillator();
+		lfo.frequency.value = 0.07;
+		const lg = ctx.createGain();
+		lg.gain.value = 0.06;
+		lfo.connect(lg).connect(amb.gain);
+		src.connect(lp).connect(amb).connect(this.master);
+		src.start();
+		lfo.start();
 	}
 
-	start() {
-		this.ensure();
-		if (!this.ctx || this.started) return;
-		this.ctx.resume();
-		this.started = true;
-		this.startWind();
-		this.scheduleBeat();
+	/** Loudness for an event at (x, z): nearer the camera and more zoomed-in = louder. */
+	private level(x: number, z: number): number {
+		const d = Math.hypot(x - this.lx, z - this.lz);
+		const near = Math.max(0.04, 1 - d / (this.ld * 1.6 + 60));
+		const zoom = Math.min(1.5, Math.max(0.45, 260 / this.ld));
+		return near * zoom;
 	}
 
-	setMuted(m: boolean) {
-		this.muted = m;
-		if (this.master && this.ctx) this.master.gain.setTargetAtTime(m ? 0 : 0.9, this.ctx.currentTime, 0.15);
+	private pan(x: number, z: number): number {
+		// rough screen-space pan: the camera looks north-east
+		const r = (x - this.lx) * 0.866 + (z - this.lz) * 0.5;
+		return Math.max(-0.8, Math.min(0.8, r / (this.ld * 0.8 + 40)));
 	}
 
-	// the engine reports the war's rhythm; the drums follow it
-	setBattle(phase: WarPhase, intensity: number) {
-		this.phase = phase;
-		this.intensity = Math.max(0, Math.min(1, intensity));
-	}
-
-	// ---------- ambient: faint night wind, nothing more ----------
-
-	private startWind() {
-		if (!this.ctx || !this.master || !this.noise) return;
-		const src = this.ctx.createBufferSource();
-		src.buffer = this.noise; src.loop = true;
-		const filt = this.ctx.createBiquadFilter();
-		filt.type = 'lowpass'; filt.frequency.value = 240; filt.Q.value = 0.4;
-		const g = this.ctx.createGain(); g.gain.value = 0.018;
-		// slow gusts
-		const lfo = this.ctx.createOscillator(); lfo.frequency.value = 0.09;
-		const lg = this.ctx.createGain(); lg.gain.value = 0.01;
-		lfo.connect(lg); lg.connect(g.gain);
-		src.connect(filt); filt.connect(g); g.connect(this.master);
-		src.start(); lfo.start();
-	}
-
-	// ---------- war drums: cadence follows the phase ----------
-
-	private scheduleBeat() {
-		if (!this.ctx) return;
-		// advance beat matches the march-step animation cycle (~0.74s)
-		const gap =
-			this.phase === 'form' ? 1.4 :
-			this.phase === 'advance' ? 0.74 :
-			this.phase === 'charge' ? 0.21 :
-			this.phase === 'melee' ? 0.52 : 1.1; // regroup
-		this.beatTimer = setTimeout(() => this.scheduleBeat(), gap * 1000);
-		if (this.muted) { this.beat++; return; }
-		const b = this.beat++;
-		if (this.phase === 'form') {
-			// sparse heartbeat while the ranks dress
-			this.tom(58, 0.16);
-		} else if (this.phase === 'advance') {
-			// marching cadence: heavy on the step, light off-beat tap
-			this.tom(b % 2 === 0 ? 88 : 68, b % 2 === 0 ? 0.34 : 0.14);
-			if (b % 4 === 0) this.tom(120, 0.1);
-		} else if (this.phase === 'charge') {
-			// rolling toms under the sprint
-			this.tom(70 + (b % 3) * 18, 0.3);
-		} else if (this.phase === 'melee') {
-			// drums back off — the fighting itself carries the mix
-			if (this.intensity > 0.1) this.tom(64, 0.1 + this.intensity * 0.12);
-		} else if (b % 2 === 0) {
-			// regroup: slow, tired pulse
-			this.tom(52, 0.1);
+	play(kind: SoundKind, x = this.lx, z = this.lz, scale = 1) {
+		if (!this.enabled || !this.ctx || !this.master || !this.noise) return;
+		const ctx = this.ctx;
+		const t = ctx.currentTime;
+		let v = kind === 'victory' || kind === 'round' ? 1 : this.level(x, z);
+		if (v < 0.03) return;
+		if (kind === 'shot') {
+			// rifle fire is rate-limited so a big firefight crackles instead of roaring
+			const now = performance.now();
+			while (this.shots.length && now - this.shots[0] > 1000) this.shots.shift();
+			if (this.shots.length > 16) return;
+			this.shots.push(now);
+			v *= 0.5 + Math.random() * 0.5;
 		}
-	}
+		const out = ctx.createGain();
+		const p = ctx.createStereoPanner();
+		p.pan.value = this.pan(x, z);
+		out.connect(p).connect(this.master);
 
-	private tom(freq: number, gain: number) {
-		if (!this.ctx || !this.master) return;
-		const t = this.ctx.currentTime;
-		const o = this.ctx.createOscillator();
-		const g = this.ctx.createGain();
-		o.type = 'sine';
-		o.frequency.setValueAtTime(freq * 1.6, t);
-		o.frequency.exponentialRampToValueAtTime(freq, t + 0.12);
-		g.gain.setValueAtTime(gain, t);
-		g.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
-		o.connect(g); g.connect(this.master);
-		o.start(t); o.stop(t + 0.42);
-	}
-
-	// ---------- combat one-shots (fired per real event) ----------
-
-	// a warrior falls: metal ring + body thud. Rate-limited so massacres
-	// read as a roar, not a machine gun.
-	kill(big = false) {
-		if (!this.ctx || !this.master || !this.noise || this.muted) return;
-		const now = this.ctx.currentTime;
-		if (now - this.lastKill < 0.07) return;
-		this.lastKill = now;
-		this.clash(big ? 0.9 : 0.35 + Math.random() * 0.25);
-		// low thud under the ring
-		const o = this.ctx.createOscillator();
-		const g = this.ctx.createGain();
-		o.type = 'sine';
-		o.frequency.setValueAtTime(big ? 110 : 150, now);
-		o.frequency.exponentialRampToValueAtTime(big ? 40 : 65, now + 0.16);
-		g.gain.setValueAtTime(big ? 0.3 : 0.12, now);
-		g.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-		o.connect(g); g.connect(this.master);
-		o.start(now); o.stop(now + 0.24);
-	}
-
-	// short metallic clash — intensity 0..1
-	clash(intensity = 0.5) {
-		if (!this.ctx || !this.master || !this.noise || this.muted) return;
-		const t = this.ctx.currentTime;
-		const src = this.ctx.createBufferSource();
-		src.buffer = this.noise;
-		const filt = this.ctx.createBiquadFilter();
-		filt.type = 'bandpass';
-		filt.frequency.value = 2600 + Math.random() * 1800;
-		filt.Q.value = 0.8;
-		const g = this.ctx.createGain();
-		const vol = 0.05 + intensity * 0.14;
-		g.gain.setValueAtTime(vol, t);
-		g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-		src.connect(filt); filt.connect(g); g.connect(this.master);
-		src.start(t); src.stop(t + 0.2);
-	}
-
-	// massed archery: the volley signal — dozens of shafts leaving at once
-	volley(count: number) {
-		if (!this.ctx || !this.master || !this.noise || this.muted) return;
-		const t = this.ctx.currentTime;
-		const src = this.ctx.createBufferSource();
-		src.buffer = this.noise;
-		const filt = this.ctx.createBiquadFilter();
-		filt.type = 'bandpass'; filt.Q.value = 1.2;
-		// rising whoosh as the arc climbs, falling as it drops
-		filt.frequency.setValueAtTime(600, t);
-		filt.frequency.exponentialRampToValueAtTime(1900, t + 0.22);
-		filt.frequency.exponentialRampToValueAtTime(420, t + 0.6);
-		const g = this.ctx.createGain();
-		const vol = Math.min(0.16, 0.05 + count * 0.004);
-		g.gain.setValueAtTime(0.0001, t);
-		g.gain.exponentialRampToValueAtTime(vol, t + 0.1);
-		g.gain.exponentialRampToValueAtTime(0.001, t + 0.65);
-		src.connect(filt); filt.connect(g); g.connect(this.master);
-		src.start(t); src.stop(t + 0.7);
-	}
-
-	// whale sky strike: TITAN = falling comet whistle into impact,
-	// GOD = rising beam shimmer into a heavier impact
-	strike(god = false) {
-		if (!this.ctx || !this.master || this.muted) return;
-		const t = this.ctx.currentTime;
-		const o = this.ctx.createOscillator();
-		const g = this.ctx.createGain();
-		if (god) {
-			o.type = 'sawtooth';
-			o.frequency.setValueAtTime(180, t);
-			o.frequency.exponentialRampToValueAtTime(1400, t + 0.5);
+		const noise = (dur: number, type: BiquadFilterType, f0: number, f1: number, q = 0.8) => {
+			const s = ctx.createBufferSource();
+			s.buffer = this.noise;
+			s.loop = true; // random start offset + long booms can outrun the 2 s buffer
+			const f = ctx.createBiquadFilter();
+			f.type = type;
+			f.frequency.setValueAtTime(f0, t);
+			f.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+			f.Q.value = q;
+			const g = ctx.createGain();
+			g.gain.setValueAtTime(1, t);
+			g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+			s.connect(f).connect(g).connect(out);
+			s.start(t, Math.random() * 1.5);
+			s.stop(t + dur + 0.05);
+		};
+		const tone = (dur: number, type: OscillatorType, f0: number, f1: number, g0: number) => {
+			const o = ctx.createOscillator();
+			o.type = type;
+			o.frequency.setValueAtTime(f0, t);
+			o.frequency.exponentialRampToValueAtTime(Math.max(10, f1), t + dur);
+			const g = ctx.createGain();
 			g.gain.setValueAtTime(0.0001, t);
-			g.gain.exponentialRampToValueAtTime(0.12, t + 0.4);
-			g.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
-		} else {
-			o.type = 'triangle';
-			o.frequency.setValueAtTime(2100, t);
-			o.frequency.exponentialRampToValueAtTime(220, t + 0.5);
+			g.gain.exponentialRampToValueAtTime(g0, t + 0.005);
+			g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+			o.connect(g).connect(out);
+			o.start(t);
+			o.stop(t + dur + 0.05);
+		};
+		const chord = (notes: readonly (readonly [number, number])[], type: OscillatorType, peak: number, hold: number, end: number, lp?: number) => {
+			for (const [hz, d] of notes) {
+				const o = ctx.createOscillator();
+				o.type = type;
+				o.frequency.value = hz;
+				const g = ctx.createGain();
+				g.gain.setValueAtTime(0.0001, t + d);
+				g.gain.exponentialRampToValueAtTime(peak, t + d + 0.05);
+				g.gain.setValueAtTime(peak, t + Math.max(d + 0.06, hold));
+				g.gain.exponentialRampToValueAtTime(0.0008, t + end);
+				if (lp) {
+					const f = ctx.createBiquadFilter();
+					f.type = 'lowpass';
+					f.frequency.value = lp;
+					o.connect(f).connect(g).connect(out);
+				} else o.connect(g).connect(out);
+				o.start(t + d);
+				o.stop(t + end + 0.05);
+			}
+		};
+		/** A looping noise bed shaped by an envelope — for engines and rotors. */
+		const bed = (filter: BiquadFilterNode, env: [number, number][], dur: number, extra?: (g: GainNode) => void) => {
+			const s = ctx.createBufferSource();
+			s.buffer = this.noise;
+			s.loop = true;
+			const g = ctx.createGain();
 			g.gain.setValueAtTime(0.0001, t);
-			g.gain.exponentialRampToValueAtTime(0.14, t + 0.08);
-			g.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+			for (const [at, val] of env) g.gain.exponentialRampToValueAtTime(val, t + at);
+			extra?.(g);
+			s.connect(filter).connect(g).connect(out);
+			s.start(t);
+			s.stop(t + dur);
+		};
+
+		switch (kind) {
+			case 'shot':
+				out.gain.value = 0.22 * v;
+				noise(0.07, 'bandpass', 1500 + Math.random() * 1500, 700, 0.9);
+				break;
+			case 'cannon':
+				out.gain.value = 0.5 * v;
+				noise(0.45, 'lowpass', 1400, 160, 0.7);
+				tone(0.35, 'sine', 90, 38, 0.9);
+				break;
+			case 'boom': {
+				const s = Math.min(2.6, scale);
+				out.gain.value = Math.min(1, 0.35 + 0.28 * s) * v;
+				noise(0.9 + 0.5 * s, 'lowpass', 2200, 90, 0.6);
+				tone(0.8 + 0.4 * s, 'sine', 62, 24, 1);
+				break;
+			}
+			case 'rocket':
+				out.gain.value = 0.18 * v;
+				noise(0.9, 'bandpass', 500, 2600, 1.4);
+				break;
+			case 'whoosh':
+				out.gain.value = 0.2 * v;
+				noise(0.8, 'highpass', 900, 3200, 0.7);
+				break;
+			case 'jet': {
+				out.gain.value = 0.55 * Math.max(0.35, v);
+				const f = ctx.createBiquadFilter();
+				f.type = 'lowpass';
+				f.frequency.setValueAtTime(300, t);
+				f.frequency.exponentialRampToValueAtTime(3200, t + 1.4);
+				f.frequency.exponentialRampToValueAtTime(260, t + 3.4);
+				p.pan.setValueAtTime(-0.7, t);
+				p.pan.linearRampToValueAtTime(0.7, t + 3.2);
+				bed(f, [[1.3, 1], [3.6, 0.0008]], 3.8);
+				break;
+			}
+			case 'heli': {
+				out.gain.value = 0.35 * Math.max(0.35, v);
+				const f = ctx.createBiquadFilter();
+				f.type = 'bandpass';
+				f.frequency.value = 170;
+				f.Q.value = 1.2;
+				// rotor chop: a square LFO on the gain
+				bed(f, [[1.5, 1], [7, 1], [10, 0.0008]], 10.2, (g) => {
+					const lfo = ctx.createOscillator();
+					lfo.type = 'square';
+					lfo.frequency.value = 12.5;
+					const lg = ctx.createGain();
+					lg.gain.value = 0.45;
+					lfo.connect(lg).connect(g.gain);
+					lfo.start(t);
+					lfo.stop(t + 10.2);
+				});
+				break;
+			}
+			case 'bomber':
+				out.gain.value = 0.3 * Math.max(0.4, v);
+				chord([[52, 0], [54.5, 0], [104, 0]], 'sawtooth', 0.4, 6, 10, 280);
+				break;
+			case 'victory':
+				out.gain.value = 0.32;
+				chord([[261.6, 0], [329.6, 0.12], [392, 0.24], [523.2, 0.42]], 'sawtooth', 0.35, 1.6, 2.6, 1400);
+				break;
+			case 'round':
+				out.gain.value = 0.22;
+				chord([[392, 0], [523.2, 0.18]], 'triangle', 0.5, 0.2, 0.7);
+				break;
 		}
-		o.connect(g); g.connect(this.master);
-		o.start(t); o.stop(t + 1);
-		// impact lands as the voice resolves
-		setTimeout(() => this.impact(god ? 0.5 : 0.3), god ? 420 : 480);
-	}
-
-	private impact(vol: number) {
-		// deferred by setTimeout from strike() — the context may have closed since
-		if (!this.ctx || this.ctx.state === 'closed' || !this.master || !this.noise || this.muted) return;
-		const t = this.ctx.currentTime;
-		const o = this.ctx.createOscillator();
-		const g = this.ctx.createGain();
-		o.type = 'sine';
-		o.frequency.setValueAtTime(110, t);
-		o.frequency.exponentialRampToValueAtTime(30, t + 0.5);
-		g.gain.setValueAtTime(vol, t);
-		g.gain.exponentialRampToValueAtTime(0.001, t + 0.6);
-		o.connect(g); g.connect(this.master);
-		o.start(t); o.stop(t + 0.62);
-		const src = this.ctx.createBufferSource();
-		src.buffer = this.noise;
-		const ng = this.ctx.createGain();
-		ng.gain.setValueAtTime(vol * 0.5, t);
-		ng.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
-		src.connect(ng); ng.connect(this.master);
-		src.start(t); src.stop(t + 0.42);
-	}
-
-	// deep war horn for titan/god arrivals and the charge signal
-	horn(god = false) {
-		if (!this.ctx || !this.master || this.muted) return;
-		const t = this.ctx.currentTime;
-		const g = this.ctx.createGain();
-		g.gain.setValueAtTime(0.0001, t);
-		g.gain.exponentialRampToValueAtTime(god ? 0.3 : 0.2, t + 0.15);
-		g.gain.exponentialRampToValueAtTime(0.0001, t + (god ? 2.2 : 1.4));
-		const filt = this.ctx.createBiquadFilter();
-		filt.type = 'lowpass'; filt.frequency.value = 700;
-		const base = god ? 65 : 87;
-		for (const m of [1, 1.5, 2.01]) {
-			const o = this.ctx.createOscillator();
-			o.type = 'sawtooth';
-			o.frequency.setValueAtTime(base * m, t);
-			o.frequency.linearRampToValueAtTime(base * m * 1.03, t + 1.2);
-			o.connect(filt); o.start(t); o.stop(t + (god ? 2.3 : 1.5));
-		}
-		filt.connect(g); g.connect(this.master);
-	}
-
-	// victory fanfare (gold vs dark)
-	victory(bull: boolean) {
-		if (!this.ctx || !this.master || this.muted) return;
-		const t0 = this.ctx.currentTime;
-		const notes = bull ? [262, 330, 392, 523] : [196, 233, 294, 233];
-		notes.forEach((f, i) => {
-			const t = t0 + i * 0.18;
-			const o = this.ctx!.createOscillator();
-			const g = this.ctx!.createGain();
-			o.type = bull ? 'triangle' : 'sawtooth';
-			o.frequency.value = f;
-			g.gain.setValueAtTime(0.0001, t);
-			g.gain.exponentialRampToValueAtTime(0.22, t + 0.04);
-			g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
-			o.connect(g); g.connect(this.master!);
-			o.start(t); o.stop(t + 0.62);
-		});
-	}
-
-	// capital collapse
-	boom() {
-		if (!this.ctx || !this.master || !this.noise || this.muted) return;
-		const t = this.ctx.currentTime;
-		const o = this.ctx.createOscillator();
-		const g = this.ctx.createGain();
-		o.type = 'sine';
-		o.frequency.setValueAtTime(120, t);
-		o.frequency.exponentialRampToValueAtTime(28, t + 0.9);
-		g.gain.setValueAtTime(0.5, t);
-		g.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
-		o.connect(g); g.connect(this.master);
-		o.start(t); o.stop(t + 1.15);
-		const src = this.ctx.createBufferSource();
-		src.buffer = this.noise;
-		const ng = this.ctx.createGain();
-		ng.gain.setValueAtTime(0.3, t);
-		ng.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
-		src.connect(ng); ng.connect(this.master);
-		src.start(t); src.stop(t + 0.85);
 	}
 
 	dispose() {
-		if (this.beatTimer) clearTimeout(this.beatTimer);
 		this.ctx?.close();
+		this.ctx = null;
 	}
 }

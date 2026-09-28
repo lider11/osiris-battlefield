@@ -1,728 +1,1161 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
-	import { Tween } from 'svelte/motion';
-	import { cubicOut } from 'svelte/easing';
-	import type { Battle, Stats, Overlay, BattleEvent, Comp } from '$lib/battle/engine';
-	import type { WarAudio } from '$lib/battle/audio';
+	import { onMount } from 'svelte';
+	import { replaceState } from '$app/navigation';
+	import { Battlefield, type BattleStats, type RoundEvent, type Scale, type Team } from '$lib/battle/engine';
+	import { THEATERS } from '$lib/market/theaters';
+	import { OsirisFeed } from '$lib/market/osiris';
+	import { BtcFeed } from '$lib/market/btc';
+	import type { Depth, Forces, MarketEvent, MarketFeed, Quote, StrikeTiers, Theater, Venue } from '$lib/market/types';
+	import { usd, grouped, shortAddr, utc } from '$lib/market/format';
 
-	let canvas = $state<HTMLCanvasElement | null>(null);
-	let battle: Battle | null = null;
-	let audio: WarAudio | null = null;
+	type TheaterId = 'osiris' | 'btc';
+	type Tone = 'bull' | 'bear' | 'neutral';
+	type FeedItem = { id: number; tone: Tone; text: string; amount: string; badge: string; badgeTone: string; href?: string; title: string };
 
-	const EMPTY_COMP: Comp = { spear: 0, duelist: 0, archer: 0, guardian: 0, chariot: 0 };
-	const EMPTY: Stats = {
-		bulls: 0, bears: 0, bullPower: 0, bearPower: 0, frontPct: 50, casualtiesBull: 0, casualtiesBear: 0,
-		fps: 0, round: 1, winBull: 0, winBear: 0, phase: 'battle', winner: null, warPhase: 'form', totalKills: 0,
-		biggestWhaleUsd: 0, biggestWhaleWallet: '', commanders: [], bullComp: { ...EMPTY_COMP }, bearComp: { ...EMPTY_COMP }
+	let canvas: HTMLCanvasElement;
+	let bf: Battlefield | null = null;
+	let feed: MarketFeed | null = null;
+
+	let theaterId = $state<TheaterId>('osiris');
+	const theater = $derived(THEATERS[theaterId]);
+	let price = $state(0);
+	let tickPct = $state(0);
+	let change24 = $state(0);
+	let sub = $state('');
+	let status = $state('');
+	let clock = $state(utc());
+	let depth = $state<Depth | null>(null);
+	let forces = $state<Forces | null>(null);
+	let items = $state<FeedItem[]>([]);
+	let lastEvent = $state('Watching the tape');
+	let pressure = $state<Tone>('neutral');
+	let sound = $state(false);
+	let source = $state('');
+	let sources = $state<{ id: string; label: string }[]>([]);
+	let depthOpen = $state(innerWidth >= 760); // collapsed by default on phones
+	let feedOpen = $state(true);
+	let stats = $state<BattleStats | null>(null);
+	let range = $state<{ lo: number; hi: number; round: number } | null>(null);
+	let banner = $state<{ kind: 'new' | 'win'; team?: Team; title: string; line: string; sub?: string; id: number } | null>(null);
+	let showTick = $state(true);
+	let failed = $state(false);
+
+	let prevPrice = 0;
+	let ticks: { t: number; p: number }[] = [];
+	let feedId = 0;
+	let bannerTimer: ReturnType<typeof setTimeout> | undefined;
+	let titleAt = 0;
+
+	const VENUE: Record<Venue | 'strike' | 'round', [string, string]> = {
+		Coinbase: ['C', '#1d5cff'],
+		Kraken: ['K', '#6c4df2'],
+		Binance: ['B', '#e8b30b'],
+		OKX: ['O', '#e9ecef'],
+		Bybit: ['Y', '#f7a600'],
+		PumpSwap: ['P', '#4ade80'],
+		strike: ['✈', '#9fb3c8'],
+		round: ['⚑', '#e8e3c8']
 	};
-	let stats = $state<Stats>({ ...EMPTY });
-	let overlay = $state<Overlay>({ tracked: [], titans: [], kills: [] });
-	let token = $state<any>(null);
-	let feed = $state<{ id: number; text: string; side: string; amt: string; big: boolean; stamp: string; icon: string }[]>([]);
+	const STRIKE_NAME = { heli: 'Helicopter strike', jet: 'Jet strike', bomber: 'Bombing run' } as const;
 
-	let entered = $state(false);
-	let ready = $state(false);
-	let muted = $state(false);
-	let flashId = $state(0);
-	function doFlash() { flashId++; }
-	let campaignBanner = $state<{ winner: string; campaign: number; mcap: string } | null>(null);
-	let campaignTimer: any;
-
-	let trackInput = $state('');
-	let tracking = $state(false);
-	let focus = $state(false);
-
-	const seen = new Set<string>();
-	let feedId = 1;
-	let tradeTimer: any, tokenTimer: any, bannerTimer: any, clockTimer: any;
-	function tick() { clock = new Date().toISOString().slice(11, 19); }
-
-	const mask = (a: string) => (a && a.length > 8 ? a.slice(0, 4) + '…' + a.slice(-4) : a || '—');
-	const fmtUsd = (n: number) => (n >= 1e9 ? '$' + (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? '$' + (n / 1e6).toFixed(2) + 'M' : n >= 1000 ? '$' + (n / 1000).toFixed(1) + 'K' : '$' + n.toFixed(0));
-	const fmtPrice = (n: number) => (n >= 1 ? '$' + n.toFixed(4) : '$' + n.toPrecision(3));
-	const pctStr = (p: number) => (p >= 0.01 ? p.toFixed(2) + '%' : p.toFixed(3) + '%');
-
-	let clock = $state('');
-	let buyUsd = $state(0), sellUsd = $state(0);
-
-	// all-time record: the war remembers across sessions (localStorage)
-	let allTime = $state<{ bull: number; bear: number; whaleUsd: number }>({ bull: 0, bear: 0, whaleUsd: 0 });
-	function loadAllTime() {
-		try { const s = localStorage.getItem('osiris_alltime'); if (s) allTime = { bull: 0, bear: 0, whaleUsd: 0, ...JSON.parse(s) }; } catch {}
-	}
-	function saveAllTime() { try { localStorage.setItem('osiris_alltime', JSON.stringify(allTime)); } catch {} }
-
-	// the big number counts up/down instead of snapping — the market breathes.
-	// first reading snaps instantly so the ticker never shows $0.
-	const mcapTween = new Tween(0, { duration: 900, easing: cubicOut });
-	let mcapPulse = $state(0);
-	let mcapInit = false;
-
-	// ── battle timeframe: 5M / 1H / 24H ──
-	type TF = 'm5' | 'h1' | 'h24';
-	let tf = $state<TF>('h1');
-	const TF_LABEL: Record<TF, string> = { m5: '5M', h1: '1H', h24: '24H' };
-	const TF_SECS: Record<TF, number> = { m5: 300, h1: 3600, h24: 86400 };
-	const win = $derived.by(() => {
-		const chg = token?.change?.[tf] ?? 0;
-		const vol = token?.volume?.[tf] ?? 0;
-		const buys = token?.txns?.[tf]?.buys ?? 0;
-		const sells = token?.txns?.[tf]?.sells ?? 0;
-		const tot = buys + sells || 1;
-		return { chg, vol, buys, sells, buyVol: vol * (buys / tot), sellVol: vol * (sells / tot), buyPct: (buys / tot) * 100 };
+	const scaleOf = (t: Theater): Scale => ({
+		step: t.step,
+		level: t.level,
+		price: t.price,
+		current: t.id === 'btc' ? 'CURRENT PRICE' : 'CURRENT MARKET CAP'
 	});
-	function applyTf() {
-		battle?.setMomentum(win.chg);
-		if (token) battle?.setMarketCap(fmtUsd(token.marketCap), win.chg);
-		// reinforcement flow scaled from the window's real txn rate
-		const scale = 55; // battle-time amplification
-		const rate = (n: number) => Math.min(2.2, Math.max(0.18, (n / TF_SECS[tf]) * scale));
-		battle?.setReinforceRates(rate(win.buys), rate(win.sells));
-	}
-	function setTf(next: TF) { tf = next; applyTf(); }
-	const pressure = $derived(buyUsd + sellUsd > 0 ? (buyUsd / (buyUsd + sellUsd)) * 100 : 50);
-	// frontPct is the bulls' share of the field — high means buyers pushing
-	const marketPressure = $derived(
-		stats.frontPct > 55 ? { t: 'BUYERS ADVANCING', c: 'green' } :
-		stats.frontPct < 45 ? { t: 'SELLERS ADVANCING', c: 'red' } : { t: 'MARKET BALANCED', c: 'dim' }
-	);
-	const powerShare = $derived(stats.bullPower + stats.bearPower > 0 ? (stats.bullPower / (stats.bullPower + stats.bearPower)) * 100 : 50);
-	const maxKills = $derived(Math.max(1, ...stats.commanders.map((c) => c.kills)));
 
-	// Order-book depth (stylised from live buy/sell pressure)
-	const depth = $derived.by(() => {
-		const bidH = Math.min(1, buyUsd / Math.max(1, buyUsd + sellUsd) + 0.15);
-		const askH = Math.min(1, sellUsd / Math.max(1, buyUsd + sellUsd) + 0.15);
-		const bid: string[] = [], ask: string[] = [];
-		for (let i = 0; i <= 24; i++) {
-			const t = i / 24;
-			const yb = 60 - Math.pow(t, 1.6) * 54 * bidH - (Math.sin(i * 1.7) * 2);
-			bid.push(`${t * 48},${Math.max(6, yb).toFixed(1)}`);
-			const ya = 60 - Math.pow(t, 1.6) * 54 * askH - (Math.cos(i * 1.7) * 2);
-			ask.push(`${100 - t * 48},${Math.max(6, ya).toFixed(1)}`);
+	const tiers = (): StrikeTiers => theater.tiers(forces?.liquidity ?? 0);
+
+	function push(i: Omit<FeedItem, 'id' | 'badge' | 'badgeTone'> & { venue: Venue | 'strike' | 'round' }) {
+		const [badge, badgeTone] = VENUE[i.venue];
+		items = [{ ...i, id: ++feedId, badge, badgeTone }, ...items].slice(0, 40);
+	}
+
+	// ── feed handlers ───────────────────────────────────────────────────
+
+	function onQuote(q: Quote) {
+		const now = Date.now();
+		tickPct = prevPrice ? ((q.price - prevPrice) / prevPrice) * 100 : 0;
+		prevPrice = q.price;
+		price = q.price;
+		change24 = q.change24h;
+		sub = q.sub ?? '';
+		bf?.setPrice(q.price);
+		// which way the line has been moving over the last ~20s
+		ticks.push({ t: now, p: q.price });
+		while (ticks.length && now - ticks[0].t > 20_000) ticks.shift();
+		const move = q.price - ticks[0].p;
+		const eps = theater.step(q.price) * 0.06;
+		pressure = move > eps ? 'bull' : move < -eps ? 'bear' : 'neutral';
+		if (now - titleAt > 1000) {
+			titleAt = now;
+			document.title = `${theater.price(q.price)} · ${theater.name} Battlefield`;
 		}
-		return { bid: bid.join(' '), ask: ask.join(' ') };
-	});
-
-	function pushFeed(text: string, side: string, amt: string, big = false, ts?: number, icon = '') {
-		const stamp = new Date((ts ?? Date.now() / 1000) * 1000).toISOString().slice(11, 19);
-		feed = [{ id: feedId++, text, side, amt, big, stamp, icon: icon || (side === 'buy' ? '▲' : '▼') }, ...feed].slice(0, 16);
 	}
 
-	async function loadToken() {
-		try {
-			const r = await fetch('/api/token');
-			if (r.ok) {
-				token = await r.json();
-				battle?.setSupply(token.supply);
-				battle?.setMcapLadder(token.marketCap);
-				battle?.setPriceLabel(fmtPrice(token.priceUsd), '$OSIRIS · CURRENT PRICE');
-				document.title = `${fmtUsd(token.marketCap)} · $OSIRIS Battlefield`;
-				if (!mcapInit) { mcapInit = true; mcapTween.set(token.marketCap, { duration: 0 }); }
-				else {
-					if (Math.abs(token.marketCap - mcapTween.target) / Math.max(1, token.marketCap) > 0.001) mcapPulse++;
-					mcapTween.target = token.marketCap;
-				}
-				applyTf();
+	function onDepth(d: Depth | null, f: Forces) {
+		depth = d;
+		forces = f;
+		bf?.setForces(f, Math.max(1, tiers().tank));
+	}
+
+	function squadSize(v: number, t: StrikeTiers) {
+		return Math.max(3, Math.min(16, Math.round(3 + 4 * Math.log10(1 + v / Math.max(5, t.squad)))));
+	}
+
+	/** Map an event size to an air strike tier (or a rocket barrage). */
+	function strikeFor(v: number, attacker: Team, t: StrikeTiers, barrageMin: number) {
+		const tier = v >= t.bomber ? 'bomber' : v >= t.jet ? 'jet' : v >= t.heli ? 'heli' : null;
+		if (!tier) {
+			if (v >= barrageMin) bf?.strike('barrage', attacker, 1);
+			return;
+		}
+		bf?.strike(tier, attacker, Math.min(2.2, 1 + 0.35 * Math.log2(v / t[tier])));
+		push({
+			tone: attacker,
+			text: `${STRIKE_NAME[tier]} · ${attacker === 'bull' ? 'Bulls' : 'Bears'}`,
+			amount: usd(v),
+			venue: 'strike',
+			title: `${STRIKE_NAME[tier]} flown by the ${attacker === 'bull' ? 'Bulls' : 'Bears'}`
+		});
+	}
+
+	function onEvent(e: MarketEvent) {
+		const t = tiers();
+		if (e.type === 'trade') {
+			const team: Team = e.side === 'buy' ? 'bull' : 'bear';
+			const btc = theaterId === 'btc';
+			if (!e.history) {
+				if (e.usd >= t.squad) bf?.reinforce(team, squadSize(e.usd, t), e.usd >= t.tank);
+				if (theater.strikesFrom === 'trade') strikeFor(e.usd, team, t, Infinity);
 			}
-		} catch {}
-	}
-	function pctOf(amount: number): number { return token?.supply ? (amount / token.supply) * 100 : 0.015; }
-
-	async function loadTrades(seed = false) {
-		try {
-			const r = await fetch('/api/trades');
-			const d = await r.json();
-			const trades: any[] = d.trades || [];
-			let b = 0, s = 0;
-			for (const t of trades.slice(0, 40)) (t.kind === 'buy' ? (b += t.usd) : (s += t.usd));
-			buyUsd = b; sellUsd = s;
-			battle?.setPressure(b, s); // live tape drives the front-line liquidity buffers
-			// bound the dedupe set over long sessions: re-seed it from the current tape
-			// and skip one spawn cycle rather than replaying 40 stale trades as new
-			if (seen.size > 4000) { seen.clear(); for (const t of trades) seen.add(t.tx); return; }
-			for (const t of [...trades].reverse()) {
-				if (seen.has(t.tx)) continue;
-				seen.add(t.tx);
-				const pct = pctOf(t.amount);
-				battle?.spawn({ wallet: t.wallet, kind: t.kind, usd: t.usd, pct, quiet: seed });
-				if (!seed && t.usd > allTime.whaleUsd) { allTime.whaleUsd = t.usd; saveAllTime(); }
-				if (!seed) {
-					const whale = pct >= 0.25, large = t.usd >= 300;
-					const price = token?.priceUsd ? fmtPrice(token.priceUsd) : '';
-					let label: string;
-					if (t.kind === 'buy') label = whale ? `LIQUIDATED SHORT @ ${price}` : large ? 'LARGE BUY TRADE' : 'MARKET BUY';
-					else label = whale ? `LIQUIDATED LONG @ ${price}` : large ? 'LARGE SELL TRADE' : 'MARKET SELL';
-					const tag = t.kind === 'buy' ? `+1 LONG · ${pctStr(pct)}` : `+1 SHORT · ${pctStr(pct)}`;
-					pushFeed(`${label}  ·  ${tag}`, t.kind === 'buy' ? 'buy' : 'sell', fmtUsd(t.usd), whale || large, t.ts, whale ? '✦' : large ? '◆' : '');
-				}
-			}
-		} catch {}
+			if (e.usd < t.feed) return;
+			const text = btc ? `Large ${e.side} trade` : `${e.side === 'buy' ? 'Buy' : 'Sell'} · ${shortAddr(e.wallet)}`;
+			push({
+				tone: team,
+				text,
+				amount: usd(e.usd),
+				venue: e.venue,
+				href: e.tx ? `https://solscan.io/tx/${e.tx}` : undefined,
+				title: `${e.venue} ${text} ${usd(e.usd)}`
+			});
+			lastEvent = `${e.venue} · ${btc ? text : e.side === 'buy' ? 'Buy' : 'Sell'}`; // history arrives oldest-first, so this ends on the latest
+		} else {
+			// a liquidated long is a forced sell: it lands on the Bulls
+			const attacker: Team = e.side === 'long' ? 'bear' : 'bull';
+			strikeFor(e.usd, attacker, t, 10_000);
+			if (e.usd < 5_000) return;
+			const text = e.side === 'long' ? 'Long liquidated' : 'Short liquidated';
+			push({ tone: attacker, text, amount: usd(e.usd), venue: e.venue, title: `${e.venue} ${text} ${usd(e.usd)}` });
+			lastEvent = `${e.venue} · ${text}`;
+		}
 	}
 
-	function doTrack() {
-		const w = trackInput.trim();
-		if (w.length < 32) { pushFeed('Enter a valid Solana wallet to track your position.', 'sell', '', false, undefined, '◈'); return; }
-		tracking = true; battle?.setTrackWallet(w);
-		pushFeed(`TRACKING ${mask(w)} — your units marked on the field.`, 'buy', '', false, undefined, '◈');
+	function onRound(e: RoundEvent) {
+		const f = theater.price;
+		clearTimeout(bannerTimer);
+		if (e.type === 'new') {
+			range = { lo: e.lo, hi: e.hi, round: e.round };
+			banner = { kind: 'new', title: 'NEW BATTLE', line: `${f(e.lo)} – ${f(e.hi)}`, sub: `Bears win ${f(e.lo)}  |  Bulls win ${f(e.hi)}`, id: e.round };
+			push({ tone: 'neutral', text: `New battle · round ${e.round}`, amount: '', venue: 'round', title: `${f(e.lo)} – ${f(e.hi)}` });
+			bannerTimer = setTimeout(() => (banner = null), 6000);
+		} else {
+			const bull = e.winner === 'bull';
+			banner = { kind: 'win', team: e.winner, title: bull ? 'BULLS WIN' : 'BEARS WIN', line: `${bull ? 'Broke through' : 'Broke down to'} ${f(e.level)}`, id: e.round };
+			push({ tone: e.winner, text: `${bull ? 'Bulls' : 'Bears'} win the range`, amount: f(e.level), venue: 'round', title: `Round ${e.round}` });
+			bannerTimer = setTimeout(() => (banner = null), 5500);
+		}
 	}
-	function stopTrack() { tracking = false; focus = false; battle?.setTrackWallet(null); battle?.setFocus(false); }
-	function toggleFocus() { focus = !focus; battle?.setFocus(focus); }
-	function toggleSound() { muted = !muted; audio?.setMuted(muted); }
-	function resetCam() { battle?.resetCamera(); }
 
-	const trackedSummary = $derived.by(() => {
-		const t = overlay.tracked;
-		if (!t.length) return null;
-		const kills = t.reduce((a, u) => a + u.kills, 0);
-		const order = ['SOLDIER', 'ELITE', 'CHAMPION', 'TITAN', 'GARRISON'];
-		const best = t.reduce((a, u) => (order.indexOf(u.tier) > order.indexOf(a) ? u.tier : a), 'SOLDIER');
-		return { count: t.length, kills, best };
-	});
+	// ── theater switching ───────────────────────────────────────────────
 
-	const PHASE_META: Record<string, { t: string; ic: string }> = {
-		form: { t: 'FORMING RANKS', ic: '⚑' }, advance: { t: 'ADVANCING', ic: '►' },
-		charge: { t: 'CHARGE!', ic: '⚔' }, melee: { t: 'MELEE', ic: '⚔' }, regroup: { t: 'REGROUP', ic: '↻' }
-	};
+	function startTheater(id: TheaterId, updateUrl = true) {
+		feed?.stop();
+		theaterId = id;
+		items = [];
+		depth = null;
+		forces = null;
+		price = 0;
+		prevPrice = 0;
+		ticks = [];
+		range = null;
+		banner = null;
+		stats = null;
+		lastEvent = 'Watching the tape';
+		bf?.setScale(scaleOf(THEATERS[id]));
+		feed = id === 'btc' ? new BtcFeed() : new OsirisFeed();
+		sources = feed.sources;
+		source = feed.sources[0].id;
+		feed.start({ quote: onQuote, depth: onDepth, event: onEvent, status: (s) => (status = s) });
+		if (updateUrl) {
+			const u = new URL(location.href);
+			if (id === 'btc') u.searchParams.set('m', 'btc');
+			else u.searchParams.delete('m');
+			replaceState(u, {});
+		}
+	}
 
-	async function enter() {
-		entered = true;
-		const { WarAudio } = await import('$lib/battle/audio');
-		audio = new WarAudio(); audio.start(); audio.setMuted(muted);
+	function toggleSound() {
+		sound = !sound;
+		bf?.setSound(sound);
 	}
 
 	onMount(() => {
-		let alive = true;
-		loadAllTime();
-		if (new URLSearchParams(location.search).has('nointro')) { entered = true; muted = true; }
-		(async () => {
-			const { Battle } = await import('$lib/battle/engine');
-			if (!alive || !canvas) return;
-			battle = new Battle(canvas);
-			let lastWarPhase = 'form';
-			battle.onStats = (s) => {
-				if (s.warPhase === 'charge' && lastWarPhase !== 'charge' && s.phase === 'battle') audio?.horn(false);
-				lastWarPhase = s.warPhase;
-				stats = s;
-				// the drums follow the real war rhythm and how thick the fighting is
-				audio?.setBattle(s.warPhase, Math.min(s.bulls, s.bears) / 110);
-			};
-			battle.onOverlay = (o) => (overlay = o);
-			battle.onEvent = (e: BattleEvent) => {
-				if (e.type === 'legend') {
-					pushFeed(`DEATHLESS CHAMPION RISES — ${mask(e.wallet)} moved ${pctStr(e.pct)}`, e.team === 'bull' ? 'buy' : 'sell', fmtUsd(e.usd), true, undefined, '◆');
-					audio?.horn(false);
-				} else if (e.type === 'duel') {
-					pushFeed(`SINGLE COMBAT BEFORE THE HOSTS — ${e.tier}`, 'buy', '', true, undefined, '⚔');
-				} else if (e.type === 'strike') {
-					const hit = e.team === 'bull' ? 'THE BEARS' : 'THE BULLS';
-					pushFeed(`FALCON OF WAR DIVES ON ${hit}`, e.team === 'bull' ? 'buy' : 'sell', fmtUsd(e.usd), true, undefined, '𓅃');
-					audio?.strike(false);
-				} else if (e.type === 'volley') {
-					audio?.volley(e.usd);
-				} else if (e.type === 'kill') {
-					audio?.kill(e.tier === 'TITAN');
-				} else if (e.type === 'sudden') {
-					pushFeed('NO QUARTER — SUDDEN DEATH, THE STRONG PREVAIL', e.team === 'bull' ? 'buy' : 'sell', '', true, undefined, '☥');
-					audio?.horn(false);
-				}
-			};
-			battle.onCampaign = (r) => {
-				doFlash();
-				audio?.victory(r.winner === 'bull'); audio?.boom();
-				// the war remembers who has stormed the most bases across every session
-				if (r.winner === 'bull') allTime.bull++; else allTime.bear++;
-				saveAllTime();
-				campaignBanner = { winner: r.winner, campaign: r.campaign, mcap: token ? fmtUsd(token.marketCap) : '' };
-				clearTimeout(campaignTimer); campaignTimer = setTimeout(() => (campaignBanner = null), 3800);
-				pushFeed(`${r.winner === 'bull' ? 'BULLS' : 'BEARS'} STORM THE BASE — CAMPAIGN ${r.campaign} FALLS`, r.winner === 'bull' ? 'buy' : 'sell', '', true, undefined, '⚑');
-			};
-			battle.start();
-
-			await loadToken();
-			const g = (n: number) => Math.max(70, Math.min(220, Math.round(n * 1.2)));
-			battle.spawnGarrison(g(token?.buys24h ?? 120), g(token?.sells24h ?? 120));
-			await loadTrades(true);
-			// hold the gate until the armies themselves have finished downloading
-			while (alive && !battle.modelsReady) await new Promise((r) => setTimeout(r, 200));
-			ready = true;
-
-			tick(); clockTimer = setInterval(tick, 1000);
-			tradeTimer = setInterval(() => loadTrades(false), 5000);
-			tokenTimer = setInterval(loadToken, 15000);
-		})();
-		return () => { alive = false; };
+		try {
+			bf = new Battlefield(canvas, { round: onRound, stats: (s) => (stats = s) });
+			if (import.meta.env.DEV) (window as any).__bf = bf; // console access while developing
+		} catch (err) {
+			console.error(err);
+			failed = true;
+			return;
+		}
+		// the URL already names the theater on load (and the router isn't ready to rewrite it yet)
+		startTheater(new URLSearchParams(location.search).get('m') === 'btc' ? 'btc' : 'osiris', false);
+		const c = setInterval(() => (clock = utc()), 1000);
+		const flip = setInterval(() => (showTick = !showTick), 5000);
+		return () => {
+			clearInterval(c);
+			clearInterval(flip);
+			clearTimeout(bannerTimer);
+			feed?.stop();
+			bf?.dispose();
+		};
 	});
 
-	onDestroy(() => { clearInterval(tradeTimer); clearInterval(tokenTimer); clearInterval(clockTimer); clearTimeout(bannerTimer); clearTimeout(campaignTimer); audio?.dispose(); battle?.dispose(); });
+	// ── derived HUD values ──────────────────────────────────────────────
+
+	const chart = $derived.by(() => {
+		if (!depth) return null;
+		const W = 300;
+		const H = 104;
+		const top = 16;
+		const d = depth;
+		const max = Math.max(d.bids[d.bids.length - 1].c, d.asks[d.asks.length - 1].c, 1);
+		const X = (p: number) => ((p - d.lo) / (d.hi - d.lo)) * W;
+		const Y = (c: number) => H - (c / max) * (H - top);
+		const line = (pts: { p: number; c: number }[]) => {
+			let s = `M${X(pts[0].p).toFixed(1)},${H}`;
+			let y = H;
+			for (const q of pts) {
+				const x = X(q.p).toFixed(1);
+				s += `L${x},${y.toFixed(1)}`;
+				y = Y(q.c);
+				s += `L${x},${y.toFixed(1)}`;
+			}
+			return s;
+		};
+		const bl = line(d.bids);
+		const al = line(d.asks);
+		return {
+			W,
+			H,
+			mid: X(d.mid),
+			bidLine: bl,
+			askLine: al,
+			bidArea: `${bl}L${X(d.bids[d.bids.length - 1].p).toFixed(1)},${H}Z`,
+			askArea: `${al}L${X(d.asks[d.asks.length - 1].p).toFixed(1)},${H}Z`
+		};
+	});
+
+	const sourceLabel = $derived(sources.find((s) => s.id === source)?.label ?? '');
+	const axis = (v: number) => (theaterId === 'btc' ? grouped(v, 2) : grouped(v));
+	const pressureText = $derived(pressure === 'bull' ? 'Buyers advancing' : pressure === 'bear' ? 'Sellers advancing' : 'Holding the line');
+	const tickText = $derived(
+		showTick || !change24
+			? `${tickPct >= 0 ? '+' : ''}${tickPct.toFixed(3)}% tick`
+			: `${change24 >= 0 ? '+' : ''}${change24.toFixed(2)}% 24h`
+	);
+	const tickTone = $derived(showTick || !change24 ? (tickPct > 0 ? 'bull' : tickPct < 0 ? 'bear' : 'neutral') : change24 >= 0 ? 'bull' : 'bear');
+	const progress = $derived(stats?.progress ?? 0.5);
 </script>
 
-<svelte:head><title>OSIRIS · Market Battlefield</title></svelte:head>
+<svelte:head>
+	<title>OSIRIS Battlefield</title>
+</svelte:head>
 
-<canvas bind:this={canvas} class="scene"></canvas>
-<div class="cine"></div>
+<main>
+	<canvas bind:this={canvas} aria-label="3D battlefield"></canvas>
 
-<div class="labels">
-	{#each overlay.titans.slice(0, 10) as t}
-		{#if t.on}
-			<div class="titan-label" class:bear={t.team === 'bear'} style="transform:translate3d({t.x}px,{t.y}px,0) translate(-50%,-100%)">
-				{t.label}
-				<div class="ti-hp" class:bear={t.team === 'bear'}><span style="width:{(t.hp / t.maxHp) * 100}%"></span></div>
-			</div>
-		{/if}
-	{/each}
-	{#each overlay.tracked.slice(0, 8) as u}
-		{#if u.on}
-			<div class="track-label" style="transform:translate3d({u.x}px,{u.y}px,0) translate(-50%,-100%)">
-				<div class="tl-tier">◆ {u.tier}</div>
-				<div class="tl-hp"><span style="width:{(u.hp / u.maxHp) * 100}%"></span></div>
-			</div>
-		{/if}
-	{/each}
-	{#each overlay.kills.slice(0, 20) as k}
-		{#if k.on}
-			<div class="kill-marker mono" class:bear={k.team === 'bear'} style="transform:translate3d({k.x}px,{k.y}px,0) translate(-50%,-100%);opacity:{1 - k.age}">
-				✕ {k.team === 'bull' ? 'LONG DOWN' : 'SHORT DOWN'}
-			</div>
-		{/if}
-	{/each}
-</div>
-
-{#key flashId}{#if flashId > 0}<div class="flash"></div>{/if}{/key}
-
-{#if campaignBanner}
-	<div class="campaign" class:bear={campaignBanner.winner === 'bear'}>
-		<div class="camp-mark display">𓂀</div>
-		<div class="camp-sub mono">— CAMPAIGN {campaignBanner.campaign} · BASE OVERRUN —</div>
-		<div class="camp-title display">{campaignBanner.winner === 'bull' ? 'BULLS STORM THE BASE' : 'BEARS STORM THE BASE'}</div>
-		<div class="camp-mcap mono">NEW FRONT OPENS @ <span class:green={campaignBanner.winner === 'bull'} class:red={campaignBanner.winner === 'bear'}>{campaignBanner.mcap}</span> MARKET CAP</div>
-	</div>
-{/if}
-
-{#if !entered}
-	<div class="intro">
-		<div class="intro-inner">
-			<div class="intro-eye display">𓂀</div>
-			<h1 class="intro-title display">OSIRIS <span class="gt">MARKET</span> BATTLEFIELD</h1>
-			<div class="intro-tag mono">$OSIRIS · BUYS vs SELLS · LIVE ON-CHAIN WARFARE</div>
-			<div class="intro-chips mono">
-				<span class="ichip"><i class="live-dot"></i> LIVE ORDER FLOW</span>
-				<span class="ichip">𓅃 FALCON SKY STRIKES</span>
-				<span class="ichip">⛨ WAR CHARIOTS</span>
-				<span class="ichip">𓅃 CATAPULT SIEGE</span>
-			</div>
-			<p class="intro-lore">
-				Every <span class="green">buy</span> deploys a soldier for the <span class="green">bulls</span>;
-				every <span class="red">sell</span> reinforces the <span class="red">bears</span>.
-				Bigger orders field mightier warriors — spearmen hold the line, twin-blade duelists
-				dance through the melee, archers rain bolts, champions ride
-				<span class="green">war chariots</span>, and the biggest whales field towering
-				<span class="green">titans</span>. Catapults hurl fire from the rear, and the market cap
-					itself drives the front line. The war never stops.
-			</p>
-			<button class="enter-btn" onclick={enter} disabled={!ready}><span>{ready ? 'ENTER THE BATTLEFIELD' : 'MUSTERING THE ARMIES…'}</span></button>
-			<div class="intro-hint mono">W A S D PAN · SCROLL ZOOM · DRAG ORBIT · SOUND ON</div>
-		</div>
-	</div>
-{/if}
-
-<!-- TOP: MARKET CAP + PRICE + PRESSURE -->
-<header class="topbar">
-	<div class="brand">
-		<span class="brand-mark display">☥ OSIRIS</span>
-		<span class="brand-sub mono">MARKET BATTLEFIELD</span>
-		<span class="brand-rule"></span>
-		<span class="brand-clock mono"><span class="live-dot sm"></span> UTC {clock}</span>
-	</div>
-	<div class="ticker">
-		{#if token}
-			<div class="mcap">
-				<span class="kick mono">$OSIRIS MARKET CAP · AGGREGATED SPOT</span>
-				{#key mcapPulse}<span class="mcap-v mono pulse">{fmtUsd(mcapTween.current)}</span>{/key}
-			</div>
-			<div class="subline mono">
-				<span class="price">{fmtPrice(token.priceUsd)}</span>
-				<span class="chg-pill" class:up={win.chg >= 0} class:down={win.chg < 0}>{win.chg >= 0 ? '▲' : '▼'} {Math.abs(win.chg).toFixed(2)}% {TF_LABEL[tf]}</span>
-				<span class="pressure {marketPressure.c}">{marketPressure.t}</span>
-				<span class="live-dot"></span><span class="red mono">LIVE</span>
-			</div>
-			<div class="front-meter mono" title="Front line — bulls vs bears">
-				<span class="fm-side green">◤ {Math.round(stats.frontPct)}%</span>
-				<div class="frontbar">
-					<span class="fb-fill" style="width:{stats.frontPct}%"></span>
-					<span class="fb-notch"></span>
-					<span class="fb-marker" style="left:{stats.frontPct}%"></span>
-				</div>
-				<span class="fm-side red">{Math.round(100 - stats.frontPct)}% ◥</span>
-			</div>
-			<div class="tf-row mono">
-				<div class="tf-toggle">
-					{#each (['m5', 'h1', 'h24'] as const) as t}
-						<button class="tf-btn" class:on={tf === t} onclick={() => setTf(t)}>{TF_LABEL[t]}</button>
-					{/each}
-				</div>
-				<span class="chip"><span class="dim">VOL</span> {fmtUsd(win.vol)}</span>
-				<span class="chip"><span class="dim">TXNS</span> <span class="green">{win.buys}B</span><span class="dim">/</span><span class="red">{win.sells}S</span></span>
-				<span class="chip"><span class="dim">FLOW</span> <span class:green={win.buyPct >= 50} class:red={win.buyPct < 50}>{win.buyPct.toFixed(0)}% BUY</span></span>
-			</div>
-		{/if}
-	</div>
-	<div class="top-right">
-		<div class="tally glass mono warphase" class:hot={stats.warPhase === 'charge' || stats.warPhase === 'melee'}>
-			<span class="wp-ic">{PHASE_META[stats.warPhase]?.ic}</span> {PHASE_META[stats.warPhase]?.t}
-		</div>
-		<div class="tally glass mono"><span class="dim">CAMPAIGN</span> <span class="gold">{stats.round}</span></div>
-		<div class="tally glass mono"><span class="green">{stats.winBull}W</span><span class="dim">WARS</span><span class="red">{stats.winBear}W</span></div>
-		<button class="icon-btn glass mono" onclick={toggleSound} title={muted ? 'Unmute' : 'Mute'}>{muted ? '🔇' : '🔊'}</button>
-	</div>
-</header>
-
-<!-- SELL WALL (left) -->
-<div class="wall left">
-	<div class="wall-kick mono red">SELL WALL · {TF_LABEL[tf]}</div>
-	<div class="wall-v mono red">{fmtUsd(win.sellVol)}</div>
-	<div class="wall-bar sell"><span style="width:{100 - pressure}%"></span></div>
-	<div class="wall-sub mono dim">TAPE {fmtUsd(sellUsd)}</div>
-</div>
-
-<!-- BUY WALL (right) -->
-<div class="wall right">
-	<div class="wall-kick mono green">BUY WALL · {TF_LABEL[tf]}</div>
-	<div class="wall-v mono green">{fmtUsd(win.buyVol)}</div>
-	<div class="wall-bar buy"><span style="width:{pressure}%"></span></div>
-	<div class="wall-sub mono dim">TAPE {fmtUsd(buyUsd)}</div>
-</div>
-
-<!-- WAR LEDGER: top killer wallets + casualties (top-left, under sell wall) -->
-<div class="ledger glass panel-1">
-	<div class="p-head mono"><span><i class="p-glyph">𓁹</i> WAR LEDGER</span><span class="dim">KILLS</span></div>
-	{#each stats.commanders as c, i (c.wallet)}
-		<div class="ledger-row mono">
-			<span class="lg-rank" class:first={i === 0}>{i === 0 ? '𓁹' : '◆'}</span>
-			<span class="ledger-w" class:green={c.team === 'bull'} class:red={c.team === 'bear'}>{mask(c.wallet)}</span>
-			<span class="ledger-tier dim">{c.tier}</span>
-			<span class="lg-bar"><span style="width:{(c.kills / maxKills) * 100}%" class:red={c.team === 'bear'}></span></span>
-			<span class="ledger-k">{c.kills}</span>
-		</div>
-	{:else}
-		<div class="ledger-row mono"><span class="dim">Big trades field commanders…</span></div>
-	{/each}
-	<div class="ledger-foot mono">
-		<span class="dim">FALLEN</span>
-		<span class="green">{stats.casualtiesBull}</span><span class="dim">/</span><span class="red">{stats.casualtiesBear}</span>
-		{#if stats.biggestWhaleUsd > 0}
-			<span class="dim">· TOP WHALE</span> <span class="gold">{fmtUsd(stats.biggestWhaleUsd)}</span>
-		{/if}
-	</div>
-	{#if allTime.bull + allTime.bear > 0}
-		<div class="ledger-alltime mono">
-			<span class="dim">ALL-TIME</span>
-			<span class="green">{allTime.bull}W</span><span class="dim">·</span><span class="red">{allTime.bear}W</span>
-			{#if allTime.whaleUsd > 0}<span class="dim">· RECORD</span> <span class="gold">{fmtUsd(allTime.whaleUsd)}</span>{/if}
+	{#if failed}
+		<div class="fail">
+			<h1>WebGL isn't available</h1>
+			<p>The battlefield needs a browser with hardware-accelerated WebGL 2.</p>
 		</div>
 	{/if}
-</div>
 
-<!-- ORDER BOOK DEPTH (bottom-left) -->
-<div class="orderbook glass panel-2">
-	<div class="p-head mono"><span><i class="p-glyph">𓈗</i> ORDER BOOK DEPTH</span><span class="dim">AGGREGATED SPOT</span></div>
-	<svg viewBox="0 0 100 64" class="ob-chart" preserveAspectRatio="none">
-		<polyline points="0,64 {depth.bid} 48,64" fill="rgba(20,241,149,0.16)" stroke="var(--green)" stroke-width="0.8" />
-		<polyline points="100,64 {depth.ask} 52,64" fill="rgba(255,77,94,0.16)" stroke="var(--crimson)" stroke-width="0.8" />
-		<line x1="50" y1="0" x2="50" y2="64" stroke="rgba(255,255,255,0.25)" stroke-width="0.4" stroke-dasharray="1 1.5" />
-	</svg>
-	<div class="ob-split mono"><span class="green">BID {pressure.toFixed(0)}%</span><span class="red">ASK {(100 - pressure).toFixed(0)}%</span></div>
-	<div class="ob-foot mono">
-		<span class="green">{token ? fmtPrice(token.priceUsd * 0.982).replace('$', '') : 'BID'}</span>
-		<span class="dim">{token ? fmtPrice(token.priceUsd) : '—'}</span>
-		<span class="red">{token ? fmtPrice(token.priceUsd * 1.018).replace('$', '') : 'ASK'}</span>
-	</div>
-</div>
-
-<!-- ORDER FLOW ARMIES (bottom-left, above track) -->
-<div class="forces glass panel-3">
-	<div class="p-head mono"><span><i class="p-glyph">⚔</i> ORDER FLOW ARMIES</span><span class="dim">{stats.bulls + stats.bears} FIELDED</span></div>
-	<div class="power-bar" title="Fighting power — bulls vs bears">
-		<span class="pb-bull" style="width:{powerShare}%"></span>
-	</div>
-	<div class="force">
-		<div class="force-head green mono">◤ BULLS · LONGS <span class="force-n">{stats.bulls}</span></div>
-		<div class="force-comp mono"><span><em>SPR</em> {stats.bullComp.spear}</span><span><em>DUE</em> {stats.bullComp.duelist}</span><span><em>ARC</em> {stats.bullComp.archer}</span><span><em>CHA</em> {stats.bullComp.chariot}</span><span><em>GRD</em> {stats.bullComp.guardian}</span></div>
-	</div>
-	<div class="force">
-		<div class="force-head red mono">BEARS · SHORTS ◥ <span class="force-n">{stats.bears}</span></div>
-		<div class="force-comp mono"><span><em>SPR</em> {stats.bearComp.spear}</span><span><em>DUE</em> {stats.bearComp.duelist}</span><span><em>ARC</em> {stats.bearComp.archer}</span><span><em>CHA</em> {stats.bearComp.chariot}</span><span><em>GRD</em> {stats.bearComp.guardian}</span></div>
-	</div>
-</div>
-
-<!-- MARKET FEED (bottom-right) -->
-<div class="feed glass panel-1">
-	<div class="p-head mono"><span><i class="p-glyph">𓅓</i> MARKET FEED</span><span class="green">● LIVE</span></div>
-	<div class="feed-rows">
-		{#each feed as f (f.id)}
-			<div class="feed-row" class:big={f.big} class:buy={f.side === 'buy'} class:sell={f.side === 'sell'}>
-				<span class="feed-ic mono">{f.icon}</span>
-				<span class="feed-body">
-					<span class="feed-text mono">{f.text}</span>
-					<span class="feed-stamp mono dim">{f.stamp} UTC</span>
-				</span>
-				{#if f.amt}<span class="feed-amt mono">{f.amt}</span>{/if}
-			</div>
-		{/each}
-	</div>
-</div>
-
-<!-- TRACK POSITION (bottom-right, below feed) -->
-<div class="track glass panel-2">
-	{#if !tracking}
-		<div class="track-row">
-			<input class="input" bind:value={trackInput} placeholder="◈ Track your wallet on the field…" onkeydown={(e) => e.key === 'Enter' && doTrack()} />
-			<button class="btn btn-green" onclick={doTrack}>TRACK</button>
+	<!-- top-left: clock, brand, theater -->
+	<div class="tl">
+		<div class="clock mono" aria-label="UTC time">UTC {clock}</div>
+		<div class="brand">
+			<span class="ankh">☥</span>
+			<span>OSIRIS <b>BATTLEFIELD</b></span>
 		</div>
-	{:else}
-		<div class="track-live mono">
-			<span class="track-dot"></span>
-			{#if trackedSummary}
-				<span class="dim">YOUR UNITS</span> <span class="green">{trackedSummary.count}</span>
-				<span class="dim">· RANK</span> <span>{trackedSummary.best}</span>
-				<span class="dim">· SLAIN</span> <span class="red">{trackedSummary.kills}</span>
-			{:else}<span class="dim">No live units — trade to deploy</span>{/if}
-			<button class="mini" class:on={focus} onclick={toggleFocus}>{focus ? '◉ FOLLOW' : '⤢ FOLLOW'}</button>
-			<button class="mini" onclick={stopTrack}>✕</button>
+		<div class="theaters" role="tablist" aria-label="Market">
+			{#each Object.values(THEATERS) as t (t.id)}
+				<button role="tab" aria-selected={theaterId === t.id} class:on={theaterId === t.id} onclick={() => theaterId !== t.id && startTheater(t.id)}>
+					{t.name}
+				</button>
+			{/each}
+		</div>
+		<div class="status">{status}</div>
+	</div>
+
+	<!-- top-centre: price + pressure -->
+	<div class="top">
+		<div class="quote">
+			<div class="label">{theater.pairLabel(sourceLabel)}</div>
+			<div class="price mono">{price ? theater.price(price) : '—'}</div>
+			<div class="tick mono {tickTone}">{price ? tickText : ' '}</div>
+			{#if sub}<div class="sub mono">{sub}</div>{/if}
+		</div>
+		<div class="pressure">
+			<div class="label">MARKET PRESSURE</div>
+			<div class="ptext {pressure}">{pressureText}</div>
+			<div class="pev">{lastEvent}</div>
+		</div>
+	</div>
+
+	{#if range}
+		<div class="roundbar">
+			<span class="rb-edge bear mono">{theater.price(range.lo)}</span>
+			<div class="rb-track" title="Front line position inside this round's range">
+				<div class="rb-fill" style="width:{progress * 100}%"></div>
+				<div class="rb-mark" style="left:{progress * 100}%"></div>
+			</div>
+			<span class="rb-edge bull mono">{theater.price(range.hi)}</span>
+			<span class="rb-round">R{range.round} · <b class="bull">{stats?.wins[0] ?? 0}</b>–<b class="bear">{stats?.wins[1] ?? 0}</b></span>
 		</div>
 	{/if}
-</div>
 
-<div class="controls mono dim">
-	<span class="key">W</span><span class="key">A</span><span class="key">S</span><span class="key">D</span> PAN
-	<span class="sep">·</span> <span class="key">SCROLL</span> ZOOM
-	<span class="sep">·</span> DRAG ORBIT
-	<span class="sep">·</span> <button class="link" onclick={resetCam}>RESET</button>
-	<span class="fps" class:low={stats.fps > 0 && stats.fps < 45}>{stats.fps} FPS</span>
-</div>
+	<!-- top-right controls -->
+	<div class="tr">
+		<button class="icon" title="Recenter battlefield" aria-label="Recenter battlefield" onclick={() => bf?.recenter()}>
+			<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="6" /><path d="M12 2v4M12 18v4M2 12h4M18 12h4" /><circle cx="12" cy="12" r="1.5" fill="currentColor" /></svg>
+		</button>
+		<button class="icon sound" class:on={sound} title={sound ? 'Sound on' : 'Sound off'} aria-label={sound ? 'Sound on' : 'Sound off'} onclick={toggleSound}>
+			<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+				><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor" />{#if sound}<path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" />{:else}<path d="M17 9l5 6M22 9l-5 6" />{/if}</svg
+			>
+			<span>{sound ? 'SOUND ON' : 'SOUND OFF'}</span>
+		</button>
+	</div>
+
+	<!-- walls -->
+	<div class="wall sell">
+		<div class="label">SELL WALL</div>
+		<div class="wv mono">{forces ? usd(forces.askWall) : '—'}</div>
+	</div>
+	<div class="wall buy">
+		<div class="label">BUY WALL</div>
+		<div class="wv mono">{forces ? usd(forces.bidWall) : '—'}</div>
+	</div>
+
+	<!-- banners -->
+	{#if banner}
+		{#key banner.id + banner.kind}
+			<div class="banner {banner.kind} {banner.team ?? ''}">
+				<div class="b-title">{banner.title}</div>
+				<div class="b-line mono">{banner.line}</div>
+				{#if banner.sub}<div class="b-sub mono">{banner.sub}</div>{/if}
+			</div>
+		{/key}
+	{/if}
+
+	<!-- bottom-left: depth -->
+	<section class="panel depth" class:closed={!depthOpen} aria-label="Buy and sell wall depth chart">
+		<header>
+			<div>
+				<div class="label">ORDER BOOK DEPTH</div>
+				<div class="ptitle">{theater.depthLabel(sourceLabel)}</div>
+			</div>
+			<div class="hdr-r">
+				{#if depthOpen}
+					<label class="src">
+						<span class="label">SOURCE</span>
+						<select aria-label="Order book source" bind:value={source} onchange={() => feed?.setSource(source)}>
+							{#each sources as s (s.id)}<option value={s.id}>{s.label}</option>{/each}
+						</select>
+					</label>
+				{/if}
+				<button class="chev" aria-label={depthOpen ? 'Collapse order book depth' : 'Expand order book depth'} onclick={() => (depthOpen = !depthOpen)}>
+					{depthOpen ? '▾' : '▴'}
+				</button>
+			</div>
+		</header>
+		{#if depthOpen}
+			{#if chart && depth}
+				<svg class="chart" viewBox="0 0 {chart.W} {chart.H + 2}" preserveAspectRatio="none" aria-label="Bid and ask depth chart">
+					<defs>
+						<linearGradient id="gb" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#4ade80" stop-opacity="0.45" /><stop offset="1" stop-color="#4ade80" stop-opacity="0.04" /></linearGradient>
+						<linearGradient id="ga" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#f4636b" stop-opacity="0.45" /><stop offset="1" stop-color="#f4636b" stop-opacity="0.04" /></linearGradient>
+					</defs>
+					<path d={chart.bidArea} fill="url(#gb)" />
+					<path d={chart.askArea} fill="url(#ga)" />
+					<path d={chart.bidLine} fill="none" stroke="#4ade80" stroke-width="1.4" vector-effect="non-scaling-stroke" />
+					<path d={chart.askLine} fill="none" stroke="#f4636b" stroke-width="1.4" vector-effect="non-scaling-stroke" />
+					<line x1={chart.mid} x2={chart.mid} y1="0" y2={chart.H} stroke="rgba(255,255,255,0.35)" stroke-dasharray="2 3" vector-effect="non-scaling-stroke" />
+				</svg>
+				<div class="chart-tags"><span class="bull">BID WALL</span><span class="bear">ASK WALL</span></div>
+				<div class="axis mono"><span>{axis(depth.lo)}</span><b>{axis(depth.mid)}</b><span>{axis(depth.hi)}</span></div>
+			{:else}
+				<div class="empty">Reading the book…</div>
+			{/if}
+			<div class="keys" aria-label="Map controls">
+				<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>PAN</span><kbd class="wide">SCROLL</kbd><span>ZOOM</span><kbd class="wide">R-DRAG</kbd><span>ROTATE</span>
+			</div>
+		{/if}
+	</section>
+
+	<!-- bottom-right: market feed -->
+	<section class="panel feed" class:closed={!feedOpen} aria-label="Market feed">
+		<header>
+			<div class="label">MARKET FEED</div>
+			<div class="hdr-r">
+				<span class="live"><i></i>LIVE</span>
+				<button class="chev" aria-label={feedOpen ? 'Collapse market feed' : 'Expand market feed'} onclick={() => (feedOpen = !feedOpen)}>
+					{feedOpen ? '▾' : '▴'}
+				</button>
+			</div>
+		</header>
+		{#if feedOpen}
+			<ul>
+				{#each items as it (it.id)}
+					<li class={it.tone} title={it.title}>
+						<span class="venue" style="--vc:{it.badgeTone}">{it.badge}</span>
+						{#if it.href}
+							<a href={it.href} target="_blank" rel="noopener noreferrer">{it.text}</a>
+						{:else}
+							<span class="txt">{it.text}</span>
+						{/if}
+						<span class="amt mono">{it.amount}</span>
+					</li>
+				{:else}
+					<li class="neutral quiet"><span class="txt">Listening to the tape…</span></li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+
+	{#if stats}
+		<div class="forces mono" aria-label="Forces on the field">
+			<span class="bull">{stats.soldiers[0]}</span><span class="dim">troops</span><span class="bear">{stats.soldiers[1]}</span>
+			<span class="sep">·</span>
+			<span class="bull">{stats.tanks[0]}</span><span class="dim">tanks</span><span class="bear">{stats.tanks[1]}</span>
+			<span class="sep">·</span>
+			<span class="dim">KIA</span><span>{grouped(stats.casualties[0] + stats.casualties[1])}</span>
+		</div>
+	{/if}
+
+	{#if !price && !failed}
+		<div class="loading">
+			<div class="spinner"></div>
+			<div class="l1">DEPLOYING FORCES</div>
+			<div class="l2">{status || 'Connecting…'}</div>
+		</div>
+	{/if}
+</main>
 
 <style>
-	.scene { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; z-index: 0; touch-action: none; }
-	/* cinematic letterbox — the scene reads like a shot, not a viewport */
-	.cine { position: fixed; inset: 0; z-index: 1; pointer-events: none;
-		background: linear-gradient(to bottom, rgba(2,1,4,0.55), transparent 12%), linear-gradient(to top, rgba(2,1,4,0.6), transparent 16%); }
-	.labels { position: fixed; inset: 0; z-index: 5; pointer-events: none; }
-	.titan-label { position: absolute; left: 0; top: 0; will-change: transform; font-family: var(--display); font-size: 12px; font-weight: 800; color: #7dffb0; text-shadow: 0 0 10px rgba(20,241,149,0.8), 0 2px 4px #000; white-space: nowrap; text-align: center; }
-	.titan-label.bear { color: #ff9aa6; text-shadow: 0 0 10px rgba(255,77,94,0.8), 0 2px 4px #000; }
-	.ti-hp { width: 46px; height: 3px; border-radius: 2px; background: rgba(0,0,0,0.65); margin: 2px auto 0; overflow: hidden; border: 1px solid rgba(20,241,149,0.45); }
-	.ti-hp span { display: block; height: 100%; background: var(--green); transition: width 0.3s ease; }
-	.ti-hp.bear { border-color: rgba(255,77,94,0.45); }
-	.ti-hp.bear span { background: var(--crimson); }
-	.track-label { position: absolute; left: 0; top: 0; will-change: transform; text-align: center; white-space: nowrap; }
-	.tl-tier { font-family: var(--mono); font-size: 11px; font-weight: 700; color: #fff; text-shadow: 0 0 8px var(--green), 0 2px 3px #000; }
-	.tl-hp { width: 44px; height: 4px; border-radius: 3px; background: rgba(0,0,0,0.6); margin: 3px auto 0; overflow: hidden; border: 1px solid rgba(20,241,149,0.5); }
-	.tl-hp span { display: block; height: 100%; background: var(--green); }
-
-	.campaign { position: fixed; inset: 0; z-index: 57; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; pointer-events: none; animation: rise 0.4s both; background: radial-gradient(circle at 50% 45%, rgba(20,241,149,0.14), transparent 62%); }
-	.campaign.bear { background: radial-gradient(circle at 50% 45%, rgba(255,77,94,0.16), transparent 62%); }
-	.camp-mark { position: absolute; font-size: 300px; opacity: 0.05; color: #fff; pointer-events: none; }
-	.camp-sub { font-size: 12px; letter-spacing: 0.42em; color: var(--text-2); }
-	.camp-title { font-size: 54px; font-weight: 900; letter-spacing: 0.03em; color: #fff; text-shadow: 0 0 38px rgba(20,241,149,0.55), 0 4px 20px #000; }
-	.campaign.bear .camp-title { text-shadow: 0 0 38px rgba(255,77,94,0.55), 0 4px 20px #000; }
-	.camp-mcap { font-size: 15px; letter-spacing: 0.14em; color: var(--text); }
-
-	.kill-marker { position: absolute; left: 0; top: 0; will-change: transform; font-size: 11px; font-weight: 700; color: #baffd6; letter-spacing: 0.04em; text-shadow: 0 0 8px rgba(20,241,149,0.7), 0 2px 3px #000; white-space: nowrap; }
-	.kill-marker.bear { color: #ffc2c8; text-shadow: 0 0 8px rgba(255,77,94,0.7), 0 2px 3px #000; }
-
-	.flash { position: fixed; inset: 0; z-index: 58; pointer-events: none; background: radial-gradient(circle at 50% 45%, rgba(255,255,255,0.6), rgba(200,255,220,0.2) 60%, transparent 100%); animation: flashfade 0.65s ease-out forwards; }
-	@keyframes flashfade { from { opacity: 1; } to { opacity: 0; } }
-
-	/* ── INTRO ─────────────────────────────────────────── */
-	.intro { position: fixed; inset: 0; z-index: 60; background: radial-gradient(circle at 72% 18%, rgba(120,40,50,0.22), transparent 40%), radial-gradient(circle at 50% 40%, rgba(16,10,20,0.9), rgba(4,2,7,0.98)); display: flex; align-items: center; justify-content: center; animation: rise 0.5s both; }
-	.intro-inner { text-align: center; max-width: 620px; padding: 30px; }
-	.intro-eye { font-size: 64px; color: var(--green); text-shadow: 0 0 40px rgba(20,241,149,0.5); animation: eyepulse 3s ease-in-out infinite; }
-	@keyframes eyepulse { 0%, 100% { text-shadow: 0 0 30px rgba(20,241,149,0.4); } 50% { text-shadow: 0 0 60px rgba(20,241,149,0.75); } }
-	.intro-title { font-size: 44px; font-weight: 900; letter-spacing: 0.04em; margin: 12px 0 10px; color: #fff; }
-	.intro-title .gt { background: linear-gradient(120deg, #5effa0, var(--green) 55%, #0d9e60); -webkit-background-clip: text; background-clip: text; color: transparent; }
-	.intro-tag { font-size: 11px; letter-spacing: 0.28em; color: var(--green); margin-bottom: 16px; }
-	.intro-chips { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
-	.ichip { display: inline-flex; align-items: center; gap: 6px; font-size: 9px; letter-spacing: 0.14em; color: var(--text-2); border: 1px solid var(--line-2); border-radius: 999px; padding: 6px 12px; background: rgba(255,255,255,0.03); }
-	.intro-lore { font-size: 14px; line-height: 1.9; color: var(--text-2); margin-bottom: 28px; }
-	.enter-btn { position: relative; overflow: hidden; font-family: var(--mono); font-size: 15px; font-weight: 700; letter-spacing: 0.12em; padding: 16px 40px; border-radius: 12px; cursor: pointer; color: #05130b; border: none; background: linear-gradient(120deg, #5effa0, var(--green)); box-shadow: 0 0 40px rgba(20,241,149,0.4); transition: transform 0.2s, box-shadow 0.2s; }
-	.enter-btn > span { position: relative; z-index: 1; }
-	.enter-btn::after { content: ''; position: absolute; top: 0; bottom: 0; width: 40%; left: -60%; transform: skewX(-20deg); background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent); animation: sweep 2.6s ease-in-out infinite; }
-	@keyframes sweep { 0%, 55% { left: -60%; } 85%, 100% { left: 130%; } }
-	.enter-btn:hover:not(:disabled) { transform: translateY(-2px) scale(1.02); box-shadow: 0 0 60px rgba(20,241,149,0.55); }
-	.enter-btn:disabled { opacity: 0.5; cursor: wait; background: rgba(255,255,255,0.1); color: var(--text-2); box-shadow: none; }
-	.enter-btn:disabled::after { display: none; }
-	.intro-hint { margin-top: 20px; font-size: 9px; letter-spacing: 0.22em; color: var(--text-3); }
-
-	/* ── TOPBAR ────────────────────────────────────────── */
-	.topbar { position: fixed; top: 0; left: 0; right: 0; z-index: 10; display: flex; align-items: flex-start; justify-content: space-between; padding: 16px 22px; pointer-events: none; }
-	.brand { display: flex; flex-direction: column; width: 210px; }
-	.brand-mark { font-size: 21px; font-weight: 800; color: var(--green); letter-spacing: 0.08em; text-shadow: 0 0 20px rgba(20,241,149,0.4); }
-	.brand-sub { font-size: 8px; letter-spacing: 0.36em; color: var(--text-3); margin-top: 2px; }
-	.brand-rule { width: 118px; height: 1px; margin: 7px 0 5px; background: linear-gradient(90deg, rgba(var(--gold-rgb), 0.7), transparent); }
-	.brand-clock { font-size: 10px; letter-spacing: 0.1em; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
-	.ticker { text-align: center; animation: rise 0.6s both; }
-	.mcap { display: flex; flex-direction: column; align-items: center; }
-	.mcap .kick { font-size: 9px; letter-spacing: 0.2em; color: var(--text-3); }
-	.mcap-v { font-size: 46px; font-weight: 800; color: #fff; line-height: 1.05; letter-spacing: 0.01em; text-shadow: 0 0 26px rgba(150,200,255,0.2), 0 2px 20px rgba(0,0,0,0.7); font-variant-numeric: tabular-nums; }
-	.mcap-v.pulse { animation: countflash 0.7s ease-out; }
-	@keyframes countflash { 0% { transform: scale(1); } 25% { transform: scale(1.045); text-shadow: 0 0 34px rgba(var(--gold-rgb), 0.6), 0 2px 20px rgba(0,0,0,0.6); } 100% { transform: scale(1); } }
-	.subline { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 12px; margin-top: 4px; }
-	.subline .price { color: #fff; font-weight: 700; }
-	.chg-pill { font-weight: 700; font-size: 11px; padding: 2px 9px; border-radius: 999px; letter-spacing: 0.04em; }
-	.chg-pill.up { color: #9affc4; background: rgba(20,241,149,0.12); border: 1px solid rgba(20,241,149,0.35); }
-	.chg-pill.down { color: #ffb0b8; background: rgba(255,59,78,0.12); border: 1px solid rgba(255,59,78,0.35); }
-	.pressure { font-weight: 700; letter-spacing: 0.05em; }
-	.pressure.green { color: var(--green); } .pressure.red { color: var(--crimson); } .pressure.dim { color: var(--text-2); }
-	.top-right { display: flex; align-items: center; gap: 8px; pointer-events: auto; width: 210px; justify-content: flex-end; flex-wrap: wrap; }
-	.tally { display: flex; gap: 6px; padding: 9px 11px; font-size: 11px; font-weight: 700; align-items: center; transition: border-color 0.2s; }
-	.tally:hover { border-color: rgba(var(--gold-rgb), 0.35); }
-	.warphase { font-size: 10px; letter-spacing: 0.12em; color: var(--text-2); }
-	.wp-ic { color: var(--gold); }
-	.warphase.hot { color: var(--crimson); border-color: rgba(var(--crimson-rgb), 0.5); text-shadow: 0 0 14px rgba(var(--crimson-rgb), 0.6); animation: glowpulse 1.2s ease-in-out infinite; }
-	.warphase.hot .wp-ic { color: var(--crimson); }
-	@keyframes glowpulse { 0%, 100% { box-shadow: 0 0 6px rgba(var(--crimson-rgb), 0.15); } 50% { box-shadow: 0 0 18px rgba(var(--crimson-rgb), 0.4); } }
-	.icon-btn { padding: 8px 11px; cursor: pointer; border: 1px solid var(--line); font-size: 13px; line-height: 1; color: var(--text-2); transition: all 0.2s; }
-	.icon-btn:hover { color: var(--text); border-color: rgba(var(--gold-rgb), 0.4); }
-
-	/* front meter: the war in one bar */
-	.front-meter { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 9px; }
-	.fm-side { font-size: 10px; font-weight: 700; letter-spacing: 0.06em; min-width: 52px; }
-	.fm-side.green { text-align: right; }
-	.fm-side.red { text-align: left; }
-	.frontbar { position: relative; width: 300px; height: 6px; border-radius: 4px; overflow: visible; background: linear-gradient(90deg, rgba(20,241,149,0.14), rgba(255,59,78,0.2)); border: 1px solid var(--line-2); }
-	.fb-fill { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: linear-gradient(90deg, rgba(20,241,149,0.5), rgba(20,241,149,0.9)); transition: width 0.4s ease; }
-	.fb-notch { position: absolute; left: 50%; top: -2px; width: 1px; height: 10px; background: rgba(255,255,255,0.35); }
-	.fb-marker { position: absolute; top: -4px; width: 3px; height: 14px; border-radius: 2px; background: #fff; box-shadow: 0 0 10px rgba(255,255,255,0.9); transform: translateX(-50%); transition: left 0.4s ease; }
-	.tf-row { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 9px; pointer-events: auto; }
-	.tf-toggle { display: flex; gap: 3px; padding: 3px; border-radius: 9px; background: rgba(8,10,8,0.85); border: 1px solid var(--line); }
-	.tf-btn { padding: 6px 13px; border-radius: 7px; border: none; background: none; cursor: pointer; font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--text-3); letter-spacing: 0.06em; transition: all 0.15s; }
-	.tf-btn:hover { color: var(--text); }
-	.tf-btn.on { background: rgba(20,241,149,0.18); color: var(--green); box-shadow: inset 0 0 12px rgba(20,241,149,0.12); }
-	.chip { padding: 6px 11px; border-radius: 8px; background: rgba(8,10,8,0.85); border: 1px solid var(--line); font-size: 10px; letter-spacing: 0.04em; color: var(--text); transition: border-color 0.2s; }
-	.chip:hover { border-color: rgba(var(--gold-rgb), 0.3); }
-
-	/* ── WALLS ─────────────────────────────────────────── */
-	.wall { position: fixed; top: 108px; z-index: 10; padding: 9px 13px 10px; border-radius: 11px;
-		background: linear-gradient(160deg, rgba(20,26,38,0.82), rgba(8,10,16,0.86));
-		box-shadow: 0 12px 32px -12px rgba(0,0,0,0.62), inset 0 1px 0 rgba(190,216,255,0.06); animation: rise 0.6s 0.1s both; }
-	.wall.left { left: 22px; text-align: left; border-left: 2px solid var(--crimson); }
-	.wall.right { right: 22px; text-align: right; border-right: 2px solid var(--green); }
-	.wall-kick { font-size: 9px; font-weight: 700; letter-spacing: 0.18em; opacity: 0.95; }
-	.wall-v { font-size: 27px; font-weight: 800; text-shadow: 0 0 20px currentColor; font-variant-numeric: tabular-nums; }
-	.wall-bar { width: 120px; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.08); margin: 5px 0 3px; overflow: hidden; }
-	.wall.right .wall-bar { margin-left: auto; }
-	.wall-bar span { display: block; height: 100%; border-radius: 2px; transition: width 0.6s ease; }
-	.wall-bar.buy span { background: linear-gradient(90deg, rgba(20,241,149,0.5), var(--green)); margin-left: auto; }
-	.wall-bar.sell span { background: linear-gradient(90deg, var(--crimson), rgba(255,59,78,0.5)); }
-	.wall-sub { font-size: 9px; letter-spacing: 0.08em; }
-
-	/* ── PANEL SYSTEM ──────────────────────────────────── */
-	.p-head { display: flex; justify-content: space-between; align-items: center; font-size: 9px; letter-spacing: 0.15em; color: var(--text-3); margin-bottom: 8px; }
-	.p-head > span:first-child { color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
-	.p-glyph { font-style: normal; color: var(--gold); opacity: 0.9; }
-	.panel-1 { animation: rise 0.5s 0.15s both; }
-	.panel-2 { animation: rise 0.5s 0.25s both; }
-	.panel-3 { animation: rise 0.5s 0.35s both; }
-	/* gold targeting-corner brackets on the war-console panels */
-	.panel-1, .panel-2, .panel-3 { position: relative; }
-	.panel-1::before, .panel-2::before, .panel-3::before,
-	.panel-1::after, .panel-2::after, .panel-3::after {
-		content: ''; position: absolute; width: 11px; height: 11px; pointer-events: none;
-		border: 1px solid rgba(var(--gold-rgb), 0.5);
+	main {
+		position: fixed;
+		inset: 0;
+		overflow: hidden;
+		user-select: none;
 	}
-	.panel-1::before, .panel-2::before, .panel-3::before { top: -1px; left: -1px; border-right: none; border-bottom: none; border-top-left-radius: 11px; }
-	.panel-1::after, .panel-2::after, .panel-3::after { bottom: -1px; right: -1px; border-left: none; border-top: none; border-bottom-right-radius: 11px; }
+	canvas {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		display: block;
+		touch-action: none;
+		cursor: grab;
+	}
+	canvas:active {
+		cursor: grabbing;
+	}
+	.mono {
+		font-family: var(--mono);
+	}
+	.label {
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.1em;
+		color: var(--text-3);
+		text-transform: uppercase;
+	}
+	.bull {
+		color: var(--bull);
+	}
+	.bear {
+		color: var(--bear);
+	}
+	.neutral,
+	.dim {
+		color: var(--text-2);
+	}
 
-	/* ── LEDGER ────────────────────────────────────────── */
-	.ledger { position: fixed; left: 22px; top: 178px; z-index: 10; width: 252px; padding: 11px 14px; }
-	.ledger-row { display: flex; align-items: center; gap: 7px; font-size: 10px; padding: 3px 0; }
-	.lg-rank { font-size: 9px; color: var(--text-3); width: 12px; flex-shrink: 0; }
-	.lg-rank.first { color: var(--gold); text-shadow: 0 0 8px rgba(var(--gold-rgb), 0.5); }
-	.ledger-w { width: 82px; flex-shrink: 0; }
-	.ledger-w.green { color: #9affc4; } .ledger-w.red { color: #ffb0b8; }
-	.ledger-tier { font-size: 8px; letter-spacing: 0.08em; width: 44px; flex-shrink: 0; }
-	.lg-bar { flex: 1; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.07); overflow: hidden; }
-	.lg-bar span { display: block; height: 100%; background: rgba(20,241,149,0.6); border-radius: 2px; transition: width 0.5s ease; }
-	.lg-bar span.red { background: rgba(255,77,94,0.6); }
-	.ledger-k { font-weight: 700; color: #fff; min-width: 16px; text-align: right; }
-	.ledger-foot { font-size: 9px; letter-spacing: 0.06em; margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--line); display: flex; gap: 5px; flex-wrap: wrap; }
-	.ledger-alltime { font-size: 9px; letter-spacing: 0.06em; margin-top: 4px; display: flex; gap: 5px; flex-wrap: wrap; align-items: baseline; }
+	/* ── top-left ── */
+	.tl {
+		position: absolute;
+		top: 14px;
+		left: 16px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		pointer-events: none;
+	}
+	.clock {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--text-2);
+		letter-spacing: 0.06em;
+	}
+	.brand {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		font-size: 12px;
+		font-weight: 600;
+		letter-spacing: 0.14em;
+		color: var(--text-2);
+		text-shadow: 0 1px 8px rgba(0, 0, 0, 0.8);
+	}
+	.brand b {
+		color: var(--text);
+	}
+	.ankh {
+		color: #e8c46a;
+		font-size: 15px;
+	}
+	.theaters {
+		display: inline-flex;
+		gap: 3px;
+		padding: 3px;
+		border-radius: 9px;
+		background: var(--panel);
+		border: 1px solid var(--line);
+		pointer-events: auto;
+		width: max-content;
+	}
+	.theaters button {
+		font: 700 11px var(--mono);
+		letter-spacing: 0.04em;
+		color: var(--text-2);
+		background: none;
+		border: 0;
+		padding: 6px 11px;
+		border-radius: 6px;
+		cursor: pointer;
+	}
+	.theaters button.on {
+		background: rgba(255, 255, 255, 0.1);
+		color: var(--text);
+	}
+	.status {
+		font-size: 10px;
+		color: var(--text-3);
+		letter-spacing: 0.04em;
+	}
 
-	/* ── ORDER BOOK ────────────────────────────────────── */
-	.orderbook { position: fixed; left: 22px; bottom: 132px; z-index: 10; width: 260px; padding: 12px 14px; }
-	.ob-chart { width: 100%; height: 64px; display: block; }
-	.ob-split { display: flex; justify-content: space-between; font-size: 9px; font-weight: 700; letter-spacing: 0.08em; margin-top: 5px; }
-	.ob-foot { display: flex; justify-content: space-between; font-size: 8px; letter-spacing: 0.1em; margin-top: 3px; color: var(--text-3); }
+	/* ── top centre ── */
+	.top {
+		position: absolute;
+		top: 12px;
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		align-items: stretch;
+		gap: 18px;
+		pointer-events: none;
+		text-shadow: 0 2px 14px rgba(0, 0, 0, 0.85);
+	}
+	.quote {
+		text-align: right;
+	}
+	.price {
+		font-size: 40px;
+		font-weight: 800;
+		letter-spacing: -0.02em;
+		line-height: 1.05;
+		margin-top: 2px;
+		font-variant-numeric: tabular-nums;
+	}
+	.tick {
+		font-size: 12px;
+		font-weight: 700;
+		margin-top: 2px;
+	}
+	.sub {
+		font-size: 10.5px;
+		color: var(--text-3);
+		margin-top: 2px;
+	}
+	.pressure {
+		border-left: 1px solid rgba(255, 255, 255, 0.16);
+		padding-left: 16px;
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		min-width: 190px;
+	}
+	.ptext {
+		font-size: 17px;
+		font-weight: 800;
+		margin-top: 3px;
+		color: var(--text);
+	}
+	.ptext.bull {
+		color: #c9ffd9;
+	}
+	.ptext.bear {
+		color: #ffd0d3;
+	}
+	.pev {
+		font-size: 11px;
+		color: var(--text-2);
+		margin-top: 2px;
+		font-weight: 600;
+	}
 
-	/* ── FORCES ────────────────────────────────────────── */
-	.forces { position: fixed; left: 22px; bottom: 22px; z-index: 10; width: 260px; padding: 11px 14px; display: flex; flex-direction: column; gap: 7px; }
-	.power-bar { position: relative; height: 5px; border-radius: 3px; overflow: hidden; background: linear-gradient(90deg, rgba(255,59,78,0.45), rgba(255,59,78,0.25)); }
-	.pb-bull { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, rgba(20,241,149,0.35), rgba(20,241,149,0.8)); transition: width 0.5s ease; }
-	.force-head { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; display: flex; justify-content: space-between; }
-	.force-n { color: #fff; }
-	.force-comp { display: flex; gap: 10px; font-size: 10px; color: var(--text-2); margin-top: 3px; }
-	.force-comp em { font-style: normal; font-size: 8px; letter-spacing: 0.08em; color: var(--text-3); }
+	/* ── round bar ── */
+	.roundbar {
+		position: absolute;
+		top: 118px;
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 7px 12px;
+		border-radius: 999px;
+		background: var(--panel);
+		border: 1px solid var(--line);
+		font-size: 11px;
+		white-space: nowrap;
+	}
+	.rb-edge {
+		font-weight: 700;
+		font-size: 11px;
+	}
+	.rb-track {
+		position: relative;
+		width: 190px;
+		height: 6px;
+		border-radius: 3px;
+		background: rgba(var(--bear-rgb), 0.35);
+		overflow: visible;
+	}
+	.rb-fill {
+		position: absolute;
+		inset: 0 auto 0 0;
+		border-radius: 3px;
+		background: rgba(var(--bull-rgb), 0.75);
+		transition: width 0.5s;
+	}
+	.rb-mark {
+		position: absolute;
+		top: -4px;
+		width: 2px;
+		height: 14px;
+		margin-left: -1px;
+		background: #fff;
+		box-shadow: 0 0 8px #fff;
+		transition: left 0.5s;
+	}
+	.rb-round {
+		color: var(--text-3);
+		font-weight: 600;
+	}
 
-	/* ── FEED ──────────────────────────────────────────── */
-	.feed { position: fixed; right: 22px; bottom: 78px; z-index: 10; width: 352px; padding: 11px 12px; }
-	.feed-rows { display: flex; flex-direction: column; gap: 4px; max-height: 38vh; overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent); mask-image: linear-gradient(to bottom, #000 72%, transparent); }
-	.feed-row { display: flex; align-items: center; gap: 9px; padding: 6px 9px; border-radius: 8px; border-left: 2px solid transparent; background: rgba(255,255,255,0.02); animation: slidein 0.3s both; }
-	.feed-row.buy { border-left-color: var(--green); }
-	.feed-row.sell { border-left-color: var(--crimson); }
-	.feed-row.big { background: linear-gradient(90deg, rgba(var(--gold-rgb), 0.07), rgba(255,255,255,0.02)); box-shadow: 0 0 16px rgba(var(--gold-rgb), 0.1); }
-	.feed-ic { flex-shrink: 0; width: 16px; text-align: center; font-size: 11px; color: var(--text-2); }
-	.feed-row.buy .feed-ic { color: var(--green); } .feed-row.sell .feed-ic { color: var(--crimson); }
-	.feed-row.big .feed-ic { color: var(--gold); text-shadow: 0 0 8px rgba(var(--gold-rgb), 0.6); }
-	.feed-body { flex: 1; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-	.feed-text { font-size: 10px; color: var(--text); letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-	.feed-row.buy .feed-text { color: #9affc4; } .feed-row.sell .feed-text { color: #ffb0b8; }
-	.feed-stamp { font-size: 7.5px; letter-spacing: 0.06em; }
-	.feed-amt { font-size: 11px; font-weight: 700; color: #fff; white-space: nowrap; font-variant-numeric: tabular-nums; }
-	.feed-row.big .feed-amt { color: var(--gold-hi); }
+	/* ── top right ── */
+	.tr {
+		position: absolute;
+		top: 14px;
+		right: 16px;
+		display: flex;
+		gap: 8px;
+	}
+	.icon {
+		height: 34px;
+		min-width: 34px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		padding: 0 9px;
+		border-radius: 999px;
+		border: 1px solid var(--line);
+		background: var(--panel);
+		color: var(--text-2);
+		cursor: pointer;
+		font: 700 10px var(--mono);
+		letter-spacing: 0.06em;
+	}
+	.icon:hover {
+		color: var(--text);
+		border-color: rgba(255, 255, 255, 0.2);
+	}
+	.icon.sound.on {
+		color: var(--bull);
+		border-color: rgba(var(--bull-rgb), 0.35);
+	}
 
-	/* ── TRACK ─────────────────────────────────────────── */
-	.track { position: fixed; right: 22px; bottom: 22px; z-index: 10; width: 352px; padding: 10px 12px; }
-	.track-row { display: flex; gap: 8px; }
-	.track-row .input { flex: 1; }
-	.btn-green { border-color: rgba(20,241,149,0.5); background: linear-gradient(120deg, rgba(20,241,149,0.2), rgba(20,241,149,0.06)); color: #9affc4; }
-	.btn-green:hover { box-shadow: 0 0 18px rgba(20,241,149,0.25); }
-	.track-live { display: flex; align-items: center; gap: 7px; font-size: 10px; flex-wrap: wrap; }
-	.track-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: blink 1.6s infinite; }
-	.mini { font-family: var(--mono); font-size: 9px; padding: 5px 8px; border-radius: 7px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); color: var(--text-2); cursor: pointer; transition: all 0.15s; }
-	.mini:hover { color: var(--text); }
-	.mini.on { border-color: rgba(20,241,149,0.5); color: var(--green); }
+	/* ── walls ── */
+	.wall {
+		position: absolute;
+		top: 170px;
+		padding: 10px 16px 11px;
+		min-width: 132px;
+		pointer-events: none;
+	}
+	.wall .label {
+		color: var(--text-2);
+	}
+	.wall.sell {
+		left: 0;
+		background: linear-gradient(90deg, rgba(var(--bear-rgb), 0.24), rgba(var(--bear-rgb), 0.02));
+		border-left: 3px solid var(--bear);
+	}
+	.wall.buy {
+		right: 0;
+		text-align: right;
+		background: linear-gradient(270deg, rgba(var(--bull-rgb), 0.24), rgba(var(--bull-rgb), 0.02));
+		border-right: 3px solid var(--bull);
+	}
+	.wv {
+		font-size: 22px;
+		font-weight: 800;
+		margin-top: 2px;
+		text-shadow: 0 2px 10px rgba(0, 0, 0, 0.7);
+	}
+	.wall.sell .wv {
+		color: #ff8d93;
+	}
+	.wall.buy .wv {
+		color: #7df0a6;
+	}
 
-	/* ── BOTTOM CONTROLS ───────────────────────────────── */
-	.controls { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 10; font-size: 9px; letter-spacing: 0.14em; display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 999px; background: rgba(6,8,7,0.66); border: 1px solid var(--line-2); }
-	.key { display: inline-block; border: 1px solid var(--line-2); border-radius: 4px; padding: 2px 6px; color: var(--text-2); background: rgba(255,255,255,0.03); }
-	.sep { color: var(--text-3); }
-	.fps { margin-left: 6px; color: var(--text-3); font-variant-numeric: tabular-nums; }
-	.fps.low { color: var(--crimson); }
-	.link { background: none; border: none; color: var(--green); cursor: pointer; font: inherit; letter-spacing: inherit; padding: 0; }
-	.link:hover { text-shadow: 0 0 10px rgba(20,241,149,0.6); }
+	/* ── banners ── */
+	.banner {
+		position: absolute;
+		top: 30%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		text-align: center;
+		pointer-events: none;
+		padding: 18px 34px 20px;
+		border-radius: 14px;
+		background: rgba(8, 11, 9, 0.82);
+		border: 1px solid var(--line);
+		animation: pop 0.45s cubic-bezier(0.2, 1.3, 0.4, 1) both;
+		box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+	}
+	.banner.new {
+		top: 176px;
+		transform: translateX(-50%);
+		padding: 12px 26px 14px;
+		animation-name: drop;
+	}
+	.banner.win.bull {
+		border-color: rgba(var(--bull-rgb), 0.5);
+		box-shadow: 0 0 80px rgba(var(--bull-rgb), 0.25);
+	}
+	.banner.win.bear {
+		border-color: rgba(var(--bear-rgb), 0.5);
+		box-shadow: 0 0 80px rgba(var(--bear-rgb), 0.25);
+	}
+	.b-title {
+		font-family: var(--pixel);
+		font-size: 14px;
+		letter-spacing: 0.08em;
+		color: #fff;
+	}
+	.banner.win .b-title {
+		font-size: 34px;
+	}
+	.banner.win.bull .b-title {
+		color: var(--bull);
+	}
+	.banner.win.bear .b-title {
+		color: var(--bear);
+	}
+	.b-line {
+		font-size: 17px;
+		font-weight: 800;
+		margin-top: 9px;
+	}
+	.b-sub {
+		font-size: 11px;
+		color: var(--text-2);
+		margin-top: 5px;
+		white-space: pre;
+	}
+	@keyframes pop {
+		from {
+			opacity: 0;
+			transform: translate(-50%, -50%) scale(0.85);
+		}
+	}
+	@keyframes drop {
+		from {
+			opacity: 0;
+			transform: translate(-50%, -10px);
+		}
+	}
 
-	@media (max-width: 1000px) {
-		/* compact war-room: keep the essentials (price, walls, feed, track), drop the rest */
-		.orderbook, .forces, .ledger, .controls, .cine { display: none; }
-		.topbar { padding: 10px 12px; flex-wrap: wrap; }
-		.brand, .top-right { width: auto; }
-		.brand-sub, .brand-clock, .brand-rule { display: none; }
-		.brand-mark { font-size: 16px; }
-		.ticker { order: 3; width: 100%; margin-top: 6px; }
-		.mcap-v { font-size: 26px; }
-		.subline { font-size: 10px; gap: 8px; flex-wrap: wrap; }
-		.frontbar { width: min(240px, 56vw); }
-		.fm-side { min-width: 40px; font-size: 9px; }
-		.tf-row .chip { display: none; }
-		.top-right { gap: 6px; }
-		.tally { padding: 6px 8px; font-size: 10px; }
-		.icon-btn { padding: 6px 8px; }
-		.wall { top: auto; bottom: calc(30vh + 118px); }
-		.wall.left { left: 12px; } .wall.right { right: 12px; }
-		.wall-v { font-size: 18px; }
-		.wall-sub { display: none; }
-		.wall-bar { width: 84px; }
-		.feed { width: calc(100vw - 24px); right: 12px; bottom: 66px; }
-		.feed-rows { max-height: 26vh; }
-		.track { width: calc(100vw - 24px); right: 12px; bottom: 12px; }
+	/* ── panels ── */
+	.panel {
+		position: absolute;
+		bottom: 16px;
+		background: var(--panel-2);
+		border: 1px solid var(--line);
+		border-radius: 12px;
+		box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+		overflow: hidden;
+	}
+	.panel header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 10px;
+		padding: 11px 12px 8px 14px;
+	}
+	.ptitle {
+		font-size: 11px;
+		font-weight: 800;
+		letter-spacing: 0.06em;
+		margin-top: 3px;
+	}
+	.hdr-r {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.chev {
+		width: 22px;
+		height: 22px;
+		border-radius: 6px;
+		border: 1px solid var(--line);
+		background: rgba(255, 255, 255, 0.04);
+		color: var(--text-2);
+		cursor: pointer;
+		font-size: 11px;
+	}
+	.src {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	select {
+		font: 600 11px var(--sans);
+		color: var(--text);
+		background: rgba(255, 255, 255, 0.06);
+		border: 1px solid var(--line);
+		border-radius: 6px;
+		padding: 4px 6px;
+		outline: none;
+	}
+	select option {
+		background: #111613;
+	}
+
+	.depth {
+		left: 16px;
+		width: 340px;
+	}
+	.chart {
+		display: block;
+		width: calc(100% - 24px);
+		height: 104px;
+		margin: 0 12px;
+	}
+	.chart-tags {
+		display: flex;
+		justify-content: space-between;
+		margin: -104px 14px 0;
+		height: 104px;
+		pointer-events: none;
+		font: 800 9px var(--mono);
+		letter-spacing: 0.08em;
+	}
+	.axis {
+		display: flex;
+		justify-content: space-between;
+		padding: 5px 12px 0;
+		font-size: 10px;
+		color: var(--text-3);
+	}
+	.axis b {
+		color: var(--text);
+	}
+	.empty {
+		padding: 30px 14px;
+		font-size: 11px;
+		color: var(--text-3);
+		text-align: center;
+	}
+	.keys {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 10px 12px 12px;
+		font: 700 9px var(--mono);
+		color: var(--text-3);
+		letter-spacing: 0.06em;
+	}
+	.keys span {
+		margin: 0 7px 0 3px;
+	}
+	kbd {
+		font: 700 9px var(--mono);
+		color: var(--text-2);
+		min-width: 18px;
+		height: 18px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: 1px solid rgba(255, 255, 255, 0.16);
+		border-bottom-width: 2px;
+		border-radius: 4px;
+		padding: 0 4px;
+	}
+
+	.feed {
+		right: 16px;
+		width: 330px;
+	}
+	.live {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font: 800 10px var(--mono);
+		letter-spacing: 0.1em;
+	}
+	.live i {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--bull);
+		box-shadow: 0 0 8px var(--bull);
+		animation: blink 1.4s infinite;
+	}
+	@keyframes blink {
+		50% {
+			opacity: 0.3;
+		}
+	}
+	.feed ul {
+		list-style: none;
+		max-height: min(38vh, 300px);
+		overflow-y: auto;
+		padding: 0 8px 8px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.feed li {
+		display: flex;
+		align-items: center;
+		gap: 9px;
+		padding: 7px 10px 7px 8px;
+		border-radius: 7px;
+		background: rgba(255, 255, 255, 0.035);
+		border-left: 3px solid rgba(255, 255, 255, 0.2);
+		font-size: 12px;
+		font-weight: 600;
+		animation: slide 0.35s ease-out both;
+	}
+	.feed li.bull {
+		border-left-color: var(--bull);
+	}
+	.feed li.bear {
+		border-left-color: var(--bear);
+	}
+	.feed li.quiet {
+		color: var(--text-3);
+		border-left-color: transparent;
+	}
+	@keyframes slide {
+		from {
+			opacity: 0;
+			transform: translateY(-6px);
+		}
+	}
+	.venue {
+		flex: none;
+		width: 18px;
+		height: 18px;
+		border-radius: 50%;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font: 800 9px var(--sans);
+		color: #0b0f0c;
+		background: var(--vc);
+	}
+	.feed a,
+	.feed .txt {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--text);
+		text-decoration: none;
+	}
+	.feed a:hover {
+		text-decoration: underline;
+	}
+	.amt {
+		font-size: 12px;
+		font-weight: 800;
+	}
+
+	.forces {
+		position: absolute;
+		bottom: 22px;
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		gap: 6px;
+		align-items: baseline;
+		font-size: 11px;
+		font-weight: 700;
+		padding: 6px 12px;
+		border-radius: 999px;
+		background: var(--panel);
+		border: 1px solid var(--line);
+		pointer-events: none;
+		white-space: nowrap;
+	}
+	.forces .dim {
+		color: var(--text-3);
+		font-weight: 600;
+	}
+	.forces .sep {
+		color: var(--text-3);
+		margin: 0 4px;
+	}
+
+	.loading {
+		position: absolute;
+		inset: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 12px;
+		background: radial-gradient(60% 60% at 50% 50%, rgba(11, 16, 12, 0.55), rgba(11, 16, 12, 0.92));
+		pointer-events: none;
+	}
+	.spinner {
+		width: 34px;
+		height: 34px;
+		border-radius: 50%;
+		border: 3px solid rgba(255, 255, 255, 0.12);
+		border-top-color: var(--bull);
+		border-right-color: var(--bear);
+		animation: spin 0.9s linear infinite;
+	}
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+	.l1 {
+		font-family: var(--pixel);
+		font-size: 12px;
+		letter-spacing: 0.1em;
+	}
+	.l2 {
+		font-size: 11px;
+		color: var(--text-3);
+	}
+	.fail {
+		position: absolute;
+		inset: 0;
+		display: grid;
+		place-content: center;
+		text-align: center;
+		gap: 8px;
+		background: var(--bg);
+	}
+
+	/* ── small screens ── */
+	@media (max-width: 900px) {
+		.top {
+			top: 84px;
+			gap: 12px;
+		}
+		.quote .label {
+			font-size: 9px;
+			white-space: nowrap;
+		}
+		.price {
+			font-size: 28px;
+		}
+		.pressure {
+			min-width: 0;
+		}
+		.ptext {
+			font-size: 13px;
+		}
+		.roundbar {
+			top: 182px;
+		}
+		.rb-track {
+			width: 90px;
+		}
+		.wall {
+			top: 226px;
+			min-width: 0;
+			padding: 7px 10px;
+		}
+		.wv {
+			font-size: 15px;
+		}
+		.brand,
+		.status,
+		.forces {
+			display: none;
+		}
+		.tl {
+			top: 12px;
+			left: 12px;
+			gap: 6px;
+		}
+		.depth {
+			left: 10px;
+			bottom: 10px;
+			width: calc(50% - 15px);
+		}
+		.depth .keys,
+		.depth .src {
+			display: none;
+		}
+		.feed {
+			right: 10px;
+			bottom: 10px;
+			width: calc(50% - 15px);
+		}
+		.feed ul {
+			max-height: 24vh;
+		}
+		.banner.new {
+			top: 280px;
+		}
+		.banner.win .b-title {
+			font-size: 22px;
+		}
+	}
+	@media (max-width: 520px) {
+		.pressure {
+			display: none;
+		}
+		.quote {
+			text-align: center;
+		}
 	}
 </style>
